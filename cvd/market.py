@@ -6,7 +6,7 @@ import urllib.request
 from collections import deque
 from typing import Any
 
-from cvd.config import BINANCE_REST_URL
+from cvd.config import BINANCE_FUTURES_REST_URL, BINANCE_REST_URL
 
 INTERVALS_MS = {
     "1m": 60_000,
@@ -29,6 +29,14 @@ def get_json(path: str, params: dict[str, str | int] | None = None) -> Any:
     url = f"{BINANCE_REST_URL}{path}{'?' + query if query else ''}"
     request = urllib.request.Request(url, headers={"User-Agent": "CVD-Dashboard/1.0"})
     with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+
+def get_futures_json(path: str, params: dict[str, str | int] | None = None) -> Any:
+    query = urllib.parse.urlencode(params or {})
+    url = f"{BINANCE_FUTURES_REST_URL}{path}{'?' + query if query else ''}"
+    request = urllib.request.Request(url, headers={"User-Agent": "CVD-Dashboard/1.0"})
+    with urllib.request.urlopen(request, timeout=10) as response:
         return json.load(response)
 
 
@@ -63,8 +71,44 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500) -> list[dict[str,
         }
         for item in raw_klines
     ]
-    add_sma(candles, (30, 45, 60))
+    add_sma(candles, (30, 45, 60, 120))
     return candles
+
+
+def fetch_open_interest_history(symbol: str, interval: str, limit: int = 500) -> list[dict[str, float | int]]:
+    supported = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
+    period = interval if interval in supported else "5m"
+    rows = get_futures_json(
+        "/futures/data/openInterestHist",
+        {"symbol": symbol.upper(), "period": period, "limit": min(limit, 500)},
+    )
+    return [
+        {"time": int(row["timestamp"] // 1000), "openInterest": float(row["sumOpenInterest"])}
+        for row in rows
+    ]
+
+
+def fetch_current_open_interest(symbol: str) -> dict[str, float | int]:
+    row = get_futures_json("/fapi/v1/openInterest", {"symbol": symbol.upper()})
+    return {"time": int(row["time"]), "openInterest": float(row["openInterest"])}
+
+
+def align_open_interest(
+    candles: list[dict[str, float | int]],
+    open_interest: list[dict[str, float | int]],
+) -> dict[int, float]:
+    sorted_oi = sorted(open_interest, key=lambda row: int(row["time"]))
+    result: dict[int, float] = {}
+    oi_index = 0
+    latest: float | None = None
+    for candle in candles:
+        candle_time = int(candle["time"])
+        while oi_index < len(sorted_oi) and int(sorted_oi[oi_index]["time"]) <= candle_time:
+            latest = float(sorted_oi[oi_index]["openInterest"])
+            oi_index += 1
+        if latest is not None:
+            result[candle_time] = latest
+    return result
 
 
 def add_sma(candles: list[dict[str, float | int]], periods: tuple[int, ...]) -> None:

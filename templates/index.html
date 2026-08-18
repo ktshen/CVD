@@ -44,8 +44,10 @@
         <section class="market-strip" aria-label="市場摘要">
             <div><span>MARKET</span><strong id="market-symbol">BTC / USDT</strong></div>
             <div><span>LAST</span><strong id="last-price">--</strong></div>
-            <div><span>LOCAL TICKS</span><strong id="tick-count">--</strong></div>
-            <div><span>NET CVD</span><strong id="net-cvd">--</strong></div>
+            <div class="metric-help" tabindex="0">
+                <span>LOCAL TICKS</span><strong id="tick-count">--</strong>
+                <aside>目前圖表查詢區間內，本機 SQLite 已聚合的 Binance Spot raw trade 筆數。</aside>
+            </div>
             <p id="message">正在載入 Binance 市場資料</p>
         </section>
 
@@ -58,15 +60,45 @@
                     <span>L <b id="hover-low">--</b></span>
                     <span>C <b id="hover-close">--</b></span>
                     <span id="hover-change">--</span>
-                    <span>RANGE <b id="hover-range">--</b></span>
+                </div>
+                <div class="sma-values">
+                    <span class="sma-periods">SMA 30/45/60/120</span>
+                    <span class="sma-results">
+                        <b class="sma-30" id="hover-sma30">--</b>/<b class="sma-45" id="hover-sma45">--</b>/<b class="sma-60" id="hover-sma60">--</b>/<b class="sma-120" id="hover-sma120">--</b>
+                    </span>
                 </div>
             </div>
-            <div class="chart-label volume-label">VOLUME</div>
-            <div class="chart-label cvd-label">CUMULATIVE VOLUME DELTA</div>
+            <div class="pane-legend volume-label"><strong>VOLUME</strong><span id="hover-volume">--</span></div>
+            <div class="pane-legend cvd-label"><strong>CVD</strong><span>Delta <b id="hover-delta">--</b></span><span>Cumulative <b id="hover-cvd">--</b></span></div>
+            <div class="pane-legend zscore-label"><strong>DELTA Z-SCORE</strong><span id="hover-delta-z">--</span><span id="hover-absorption">NORMAL</span></div>
+            <div class="pane-legend oi-label">
+                <strong>OPEN INTEREST CHANGE</strong>
+                <span>OI <b id="hover-oi">--</b></span>
+                <span>Change <b id="hover-oi-change">--</b></span>
+                <span>Z <b id="hover-oi-z">--</b></span>
+                <span id="hover-oi-context">OI 是 futures positioning filter，不代表多空方向。</span>
+            </div>
             <div id="chart" aria-label="價格、成交量與 CVD 圖表"></div>
             <div id="empty-state" class="empty-state" hidden>
                 <strong>尚無本地 CVD 資料</strong>
                 <span>collector 啟動並收到此 symbol 的成交後，CVD 會出現在底部。</span>
+            </div>
+        </section>
+
+        <section class="order-book" aria-label="即時委託簿">
+            <header>
+                <div><strong>SPOT ORDER BOOK</strong><span id="book-symbol">BTCUSDT · 10 LEVELS</span></div>
+                <div id="book-status" class="book-status"><i></i><span>連線中</span></div>
+            </header>
+            <div class="book-columns">
+                <div class="book-side bids">
+                    <div class="book-heading"><span>Bid price</span><span>Quantity</span><span>Total</span></div>
+                    <div id="book-bids"></div>
+                </div>
+                <div class="book-side asks">
+                    <div class="book-heading"><span>Ask price</span><span>Quantity</span><span>Total</span></div>
+                    <div id="book-asks"></div>
+                </div>
             </div>
         </section>
     </main>
