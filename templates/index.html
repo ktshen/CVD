@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Spot Order Flow</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="workspace">
+        <header class="toolbar">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true"></span>
+                <div>
+                    <strong>Spot Order Flow</strong>
+                    <span>Binance raw trade ticks</span>
+                </div>
+            </div>
+            <form id="search-form" class="search-form">
+                <label class="symbol-field">
+                    <span>SYMBOL</span>
+                    <input id="symbol" list="symbols" value="BTCUSDT" autocomplete="off" spellcheck="false" aria-label="交易對">
+                    <datalist id="symbols"></datalist>
+                </label>
+                <label class="interval-field">
+                    <span>TIMEFRAME</span>
+                    <select id="interval" aria-label="時間週期">
+                        {% for interval in intervals %}
+                        <option value="{{ interval }}" {% if interval == '5m' %}selected{% endif %}>{{ interval }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <button id="load-button" type="submit">載入圖表</button>
+            </form>
+            <div id="feed-status" class="feed-status" role="status">
+                <i></i>
+                <span>等待資料</span>
+            </div>
+        </header>
+
+        <section class="market-strip" aria-label="市場摘要">
+            <div><span>MARKET</span><strong id="market-symbol">BTC / USDT</strong></div>
+            <div><span>LAST</span><strong id="last-price">--</strong></div>
+            <div><span>LOCAL TICKS</span><strong id="tick-count">--</strong></div>
+            <div><span>NET CVD</span><strong id="net-cvd">--</strong></div>
+            <p id="message">正在載入 Binance 市場資料</p>
+        </section>
+
+        <section class="chart-shell">
+            <div class="chart-label price-label">PRICE · SMA 30 / 45 / 60</div>
+            <div class="chart-label volume-label">VOLUME</div>
+            <div class="chart-label cvd-label">CUMULATIVE VOLUME DELTA</div>
+            <div id="chart" aria-label="價格、成交量與 CVD 圖表"></div>
+            <div id="empty-state" class="empty-state" hidden>
+                <strong>尚無本地 CVD 資料</strong>
+                <span>collector 啟動並收到此 symbol 的成交後，CVD 會出現在底部。</span>
+            </div>
+        </section>
+    </main>
+    <script src="https://unpkg.com/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>
