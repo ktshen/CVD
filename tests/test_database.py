@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cvd.database import aggregate_cvd, cleanup_old_trades, connect, initialize, insert_trades
+from cvd.database import aggregate_cvd, cleanup_old_trades, connect, initialize, insert_trades, trades_after
 
 
 class DatabaseTest(unittest.TestCase):
@@ -50,6 +50,22 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(deleted, 1)
         remaining = self.connection.execute("SELECT COUNT(*) FROM spot_trades").fetchone()[0]
         self.assertEqual(remaining, 1)
+
+    def test_checkpoint_and_incremental_trades_do_not_overlap(self) -> None:
+        insert_trades(
+            self.connection,
+            [
+                ("BTCUSDT", 10, 10_000, 100.0, 2.0, 0),
+                ("BTCUSDT", 11, 20_000, 101.0, 0.5, 1),
+            ],
+        )
+
+        snapshot = aggregate_cvd(self.connection, "BTCUSDT", 60_000, 0, 60_000, max_trade_id=10)
+        incremental = trades_after(self.connection, "BTCUSDT", 10)
+
+        self.assertEqual(snapshot[0]["trades"], 1)
+        self.assertEqual(snapshot[0]["cvd"], 2.0)
+        self.assertEqual([trade["tradeId"] for trade in incremental], [11])
 
 
 if __name__ == "__main__":

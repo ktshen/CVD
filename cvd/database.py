@@ -70,6 +70,7 @@ def aggregate_cvd(
     interval_ms: int,
     start_ms: int,
     end_ms: int,
+    max_trade_id: int | None = None,
 ) -> list[dict[str, float | int]]:
     rows = connection.execute(
         """
@@ -80,10 +81,11 @@ def aggregate_cvd(
             SUM(CASE WHEN buyer_is_maker = 1 THEN quantity ELSE 0 END) AS sell_volume
         FROM spot_trades
         WHERE symbol = ? AND trade_time >= ? AND trade_time < ?
+            AND (? IS NULL OR trade_id <= ?)
         GROUP BY bucket_time
         ORDER BY bucket_time
         """,
-        (interval_ms, interval_ms, symbol.upper(), start_ms, end_ms),
+        (interval_ms, interval_ms, symbol.upper(), start_ms, end_ms, max_trade_id, max_trade_id),
     ).fetchall()
 
     cumulative = 0.0
@@ -104,6 +106,42 @@ def aggregate_cvd(
             }
         )
     return result
+
+
+def latest_trade_id(connection: sqlite3.Connection, symbol: str) -> int:
+    row = connection.execute(
+        "SELECT COALESCE(MAX(trade_id), 0) FROM spot_trades WHERE symbol = ?",
+        (symbol.upper(),),
+    ).fetchone()
+    return int(row[0])
+
+
+def trades_after(
+    connection: sqlite3.Connection,
+    symbol: str,
+    trade_id: int,
+    limit: int = 5_000,
+) -> list[dict[str, float | int]]:
+    rows = connection.execute(
+        """
+        SELECT trade_id, trade_time, price, quantity, buyer_is_maker
+        FROM spot_trades
+        WHERE symbol = ? AND trade_id > ?
+        ORDER BY trade_id
+        LIMIT ?
+        """,
+        (symbol.upper(), trade_id, limit),
+    ).fetchall()
+    return [
+        {
+            "tradeId": int(row["trade_id"]),
+            "time": int(row["trade_time"]),
+            "price": float(row["price"]),
+            "quantity": float(row["quantity"]),
+            "buyerIsMaker": bool(row["buyer_is_maker"]),
+        }
+        for row in rows
+    ]
 
 
 def cleanup_old_trades(

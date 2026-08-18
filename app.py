@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import json
+import logging
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
+from flask_sock import Sock
+from simple_websocket import ConnectionClosed
+from werkzeug.exceptions import HTTPException
 
 from cvd.config import DB_PATH
-from cvd.database import aggregate_cvd, connect, initialize
+from cvd.database import aggregate_cvd, connect, initialize, latest_trade_id, trades_after
 from cvd.market import INTERVALS_MS, fetch_klines, fetch_symbols
 
 app = Flask(__name__)
+sock = Sock(app)
 initialize(DB_PATH)
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -55,7 +62,7 @@ def index():
 @app.get("/api/symbols")
 def symbols():
     try:
-        return jsonify(fetch_symbols())
+        return jsonify([item for item in fetch_symbols() if item["quoteAsset"] == "USDT"])
     except (urllib.error.URLError, TimeoutError, KeyError) as error:
         return jsonify({"error": f"Binance symbols unavailable: {error}"}), 502
 
@@ -88,10 +95,59 @@ def chart_data():
     end_ms = max(int(time.time() * 1000) + 1, (int(candles[-1]["time"]) * 1000) + interval_ms)
     connection = connect(DB_PATH)
     try:
-        cvd = aggregate_cvd(connection, symbol, interval_ms, start_ms, end_ms)
+        checkpoint = latest_trade_id(connection, symbol)
+        cvd = aggregate_cvd(connection, symbol, interval_ms, start_ms, end_ms, checkpoint)
     finally:
         connection.close()
-    return jsonify({"symbol": symbol, "interval": interval, "candles": candles, "cvd": cvd})
+    return jsonify(
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "intervalMs": interval_ms,
+            "lastTradeId": checkpoint,
+            "candles": candles,
+            "cvd": cvd,
+        }
+    )
+
+
+@sock.route("/ws/market")
+def market_socket(websocket):
+    symbol = request.args.get("symbol", "BTCUSDT").strip().upper()
+    try:
+        trade_id = max(int(request.args.get("after", "0")), 0)
+    except ValueError:
+        websocket.send(json.dumps({"error": "after must be an integer"}))
+        return
+    connection = connect(DB_PATH)
+    try:
+        while True:
+            rows = trades_after(connection, symbol, trade_id)
+            if rows:
+                trade_id = int(rows[-1]["tradeId"])
+                websocket.send(json.dumps({"type": "trades", "symbol": symbol, "trades": rows}))
+            time.sleep(0.25)
+    except ConnectionClosed:
+        return
+    except Exception:
+        logging.exception("Market WebSocket failed for %s after trade %d", symbol, trade_id)
+        try:
+            websocket.send(json.dumps({"error": traceback.format_exc()}))
+        except ConnectionClosed:
+            pass
+    finally:
+        connection.close()
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    if isinstance(error, HTTPException):
+        return error
+    logging.exception("Unhandled request error: %s %s", request.method, request.path)
+    details = traceback.format_exc()
+    if request.path.startswith("/api/"):
+        return jsonify({"error": str(error), "type": type(error).__name__, "details": details}), 500
+    return f"<h1>Internal Server Error</h1><pre>{details}</pre>", 500
 
 
 if __name__ == "__main__":

@@ -26,5 +26,27 @@ class WorkerSupervisorTest(unittest.TestCase):
         cleanup.wait.assert_called_once_with(timeout=10)
 
 
+class ApiTest(unittest.TestCase):
+    @patch("app.fetch_symbols")
+    def test_symbols_returns_only_usdt_pairs(self, fetch_symbols) -> None:
+        fetch_symbols.return_value = [
+            {"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT"},
+            {"symbol": "ETHBTC", "baseAsset": "ETH", "quoteAsset": "BTC"},
+        ]
+
+        response = app_module.app.test_client().get("/api/symbols")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["symbol"] for item in response.get_json()], ["BTCUSDT"])
+
+    @patch("app.fetch_klines", side_effect=RuntimeError("database exploded"))
+    def test_unexpected_api_error_returns_details(self, fetch_klines) -> None:
+        response = app_module.app.test_client().get("/api/chart?symbol=BTCUSDT&interval=1m")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()["type"], "RuntimeError")
+        self.assertIn("database exploded", response.get_json()["details"])
+
+
 if __name__ == "__main__":
     unittest.main()
