@@ -17,6 +17,15 @@ python app.py
 
 初始 Klines 由 Binance REST 載入；之後頁面會連線 Flask `/ws/market`。Flask 從 SQLite 依 trade ID 增量推送 collector 已寫入的 raw ticks，瀏覽器即時更新當根 OHLC、Volume、SMA30/45/60 與 CVD，不需要手動刷新。WebSocket 斷線會每兩秒自動重連。
 
+圖表另包含：
+
+- 100-bar Delta Z-score 與 ±2 異常區間。
+- 符合 Delta Z 與 close position 條件的 bullish/bearish absorption markers。
+- Binance USD-M Futures Open Interest Change、100-bar OI change Z-score、5-bar price/OI context 與 filter 狀態。
+- Binance Spot 10 檔 Order Book，瀏覽器直接連線 `@depth10@100ms`，降低轉送延遲。
+
+OI 僅作 futures positioning filter，不代表多空方向。方向仍由 price、Spot CVD、Delta Z-score 與 VWAP 決定。Binance Futures 歷史 OI 最低粒度為 5m；1m/3m 圖會使用最近已知的 5m OI。若所在地區對 `fapi.binance.com` 回 HTTP 451，OI pane 會顯示 unavailable，Spot chart、CVD 與 Order Book 仍會運作。可透過 `BINANCE_FUTURES_REST_URL` 指向所在地區合法可用的 Binance Futures market-data endpoint。
+
 collector 每 60 秒會在 terminal 顯示一次：
 
 ```text

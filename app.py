@@ -14,9 +14,17 @@ from flask_sock import Sock
 from simple_websocket import ConnectionClosed
 from werkzeug.exceptions import HTTPException
 
-from cvd.config import DB_PATH
+from cvd.config import BINANCE_DEPTH_WS_URL, DB_PATH, OI_CHANGE_LENGTH
 from cvd.database import aggregate_cvd, connect, initialize, latest_trade_id, trades_after
-from cvd.market import INTERVALS_MS, fetch_klines, fetch_symbols
+from cvd.indicators import enrich_indicators
+from cvd.market import (
+    INTERVALS_MS,
+    align_open_interest,
+    fetch_current_open_interest,
+    fetch_klines,
+    fetch_open_interest_history,
+    fetch_symbols,
+)
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -70,7 +78,7 @@ def symbols():
 @app.get("/api/chart")
 def chart_data():
     symbol = request.args.get("symbol", "BTCUSDT").strip().upper()
-    interval = request.args.get("interval", "5m")
+    interval = request.args.get("interval", "15m")
     try:
         limit = min(max(int(request.args.get("limit", "500")), 60), 1000)
     except ValueError:
@@ -99,6 +107,20 @@ def chart_data():
         cvd = aggregate_cvd(connection, symbol, interval_ms, start_ms, end_ms, checkpoint)
     finally:
         connection.close()
+    oi_error = None
+    try:
+        oi_history = fetch_open_interest_history(symbol, interval, limit)
+    except Exception as error:
+        logging.warning("Open interest unavailable for %s: %s", symbol, error)
+        oi_history = []
+        oi_error = f"{type(error).__name__}: {error}"
+    deltas_by_time = {int(row["time"]): float(row["delta"]) for row in cvd}
+    indicators = enrich_indicators(
+        candles,
+        deltas_by_time,
+        align_open_interest(candles, oi_history),
+        OI_CHANGE_LENGTH,
+    )
     return jsonify(
         {
             "symbol": symbol,
@@ -107,8 +129,22 @@ def chart_data():
             "lastTradeId": checkpoint,
             "candles": candles,
             "cvd": cvd,
+            "indicators": indicators,
+            "oiError": oi_error,
+            "oiChangeLength": OI_CHANGE_LENGTH,
+            "depthWebSocketUrl": BINANCE_DEPTH_WS_URL,
         }
     )
+
+
+@app.get("/api/open-interest")
+def current_open_interest():
+    symbol = request.args.get("symbol", "BTCUSDT").strip().upper()
+    try:
+        return jsonify(fetch_current_open_interest(symbol))
+    except Exception as error:
+        logging.warning("Current open interest unavailable for %s: %s", symbol, error)
+        return jsonify({"error": str(error), "type": type(error).__name__}), 502
 
 
 @sock.route("/ws/market")
@@ -126,7 +162,7 @@ def market_socket(websocket):
             if rows:
                 trade_id = int(rows[-1]["tradeId"])
                 websocket.send(json.dumps({"type": "trades", "symbol": symbol, "trades": rows}))
-            time.sleep(0.25)
+            time.sleep(0.05)
     except ConnectionClosed:
         return
     except Exception:

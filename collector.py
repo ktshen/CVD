@@ -59,7 +59,7 @@ async def write_batches(queue: asyncio.Queue[Trade], stats: InsertionStats | Non
             batch = [first]
             while len(batch) < WRITE_BATCH_SIZE:
                 try:
-                    batch.append(await asyncio.wait_for(queue.get(), timeout=0.1))
+                    batch.append(await asyncio.wait_for(queue.get(), timeout=0.05))
                 except TimeoutError:
                     break
             inserted = insert_trades(connection, batch)

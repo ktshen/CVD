@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from collector import InsertionStats, parse_trade, write_batches
 from cvd.database import connect, initialize
-from cvd.market import fetch_klines
+from cvd.market import align_open_interest, fetch_klines
 
 
 class MarketTest(unittest.TestCase):
@@ -21,17 +21,24 @@ class MarketTest(unittest.TestCase):
     def test_fetch_klines_adds_sma(self, get_json) -> None:
         get_json.return_value = [
             [index * 60_000, str(index), str(index), str(index), str(index), "1"]
-            for index in range(1, 61)
+            for index in range(1, 121)
         ]
-        candles = fetch_klines("BTCUSDT", "1m", 60)
+        candles = fetch_klines("BTCUSDT", "1m", 120)
         self.assertNotIn("sma30", candles[28])
         self.assertEqual(candles[29]["sma30"], 15.5)
         self.assertEqual(candles[59]["sma60"], 30.5)
+        self.assertEqual(candles[119]["sma120"], 60.5)
 
     def test_insertion_stats_resets_each_minute(self) -> None:
         stats = InsertionStats(rows=125)
         self.assertEqual(stats.take(), 125)
         self.assertEqual(stats.take(), 0)
+
+    def test_open_interest_is_forward_filled_to_candles(self) -> None:
+        candles = [{"time": 60}, {"time": 120}, {"time": 180}]
+        open_interest = [{"time": 100, "openInterest": 10.0}, {"time": 175, "openInterest": 12.0}]
+
+        self.assertEqual(align_open_interest(candles, open_interest), {120: 10.0, 180: 12.0})
 
 
 class CollectorWriterTest(unittest.IsolatedAsyncioTestCase):
