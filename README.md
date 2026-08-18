@@ -15,6 +15,16 @@ python app.py
 - `cleanup.py`：每小時刪除五天前的成交資料。
 - `app.py`：Flask 頁面與 chart API。
 
+初始 Klines 由 Binance REST 載入；之後頁面會連線 Flask `/ws/market`。Flask 從 SQLite 依 trade ID 增量推送 collector 已寫入的 raw ticks，瀏覽器即時更新當根 OHLC、Volume、SMA30/45/60 與 CVD，不需要手動刷新。WebSocket 斷線會每兩秒自動重連。
+
+collector 每 60 秒會在 terminal 顯示一次：
+
+```text
+Collector minute summary: 123456 new rows inserted; queue depth 0
+```
+
+下拉清單與預設 collector 僅包含 `*/USDT` Spot pairs。若 API 發生未預期的 500，terminal 會輸出完整 traceback，頁面訊息與 API JSON 也會包含錯誤類型及 details。
+
 停止 Flask（例如按 `Ctrl+C`）時，parent 會 terminate 並等待 collector 與 cleanup 結束，不會留下背景程序。`run.py` 是相同入口的 alias。只清理一次可執行：
 
 ```powershell

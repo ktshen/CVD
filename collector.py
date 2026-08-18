@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import aiohttp
 
@@ -15,6 +16,16 @@ from cvd.market import fetch_symbols
 Trade = tuple[str, int, int, float, float, int]
 STREAMS_PER_CONNECTION = 500
 WRITE_BATCH_SIZE = 5_000
+
+
+@dataclass
+class InsertionStats:
+    rows: int = 0
+
+    def take(self) -> int:
+        rows = self.rows
+        self.rows = 0
+        return rows
 
 
 def selected_symbols() -> list[str]:
@@ -40,7 +51,7 @@ def parse_trade(payload: dict[str, object]) -> Trade | None:
     )
 
 
-async def write_batches(queue: asyncio.Queue[Trade]) -> None:
+async def write_batches(queue: asyncio.Queue[Trade], stats: InsertionStats | None = None) -> None:
     connection = connect(DB_PATH)
     try:
         while True:
@@ -52,12 +63,24 @@ async def write_batches(queue: asyncio.Queue[Trade]) -> None:
                 except TimeoutError:
                     break
             inserted = insert_trades(connection, batch)
+            if stats is not None:
+                stats.rows += inserted
             for _ in batch:
                 queue.task_done()
             if inserted:
                 logging.debug("Inserted %d raw trades", inserted)
     finally:
         connection.close()
+
+
+async def report_ingestion(stats: InsertionStats, queue: asyncio.Queue[Trade]) -> None:
+    while True:
+        await asyncio.sleep(60)
+        logging.info(
+            "Collector minute summary: %d new rows inserted; queue depth %d",
+            stats.take(),
+            queue.qsize(),
+        )
 
 
 async def consume_streams(
@@ -91,18 +114,21 @@ async def main() -> None:
         raise RuntimeError("No matching Binance Spot symbols were found")
     logging.info("Collecting raw trade ticks for %d symbols", len(symbols))
     queue: asyncio.Queue[Trade] = asyncio.Queue(maxsize=200_000)
-    writer = asyncio.create_task(write_batches(queue))
+    stats = InsertionStats()
+    writer = asyncio.create_task(write_batches(queue, stats))
+    reporter = asyncio.create_task(report_ingestion(stats, queue))
     async with aiohttp.ClientSession() as session:
         consumers = [
             asyncio.create_task(consume_streams(session, symbols[offset : offset + STREAMS_PER_CONNECTION], queue, index + 1))
             for index, offset in enumerate(range(0, len(symbols), STREAMS_PER_CONNECTION))
         ]
         try:
-            await asyncio.gather(writer, *consumers)
+            await asyncio.gather(writer, reporter, *consumers)
         finally:
             for consumer in consumers:
                 consumer.cancel()
             writer.cancel()
+            reporter.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await writer
 

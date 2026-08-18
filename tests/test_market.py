@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from collector import parse_trade, write_batches
+from collector import InsertionStats, parse_trade, write_batches
 from cvd.database import connect, initialize
 from cvd.market import fetch_klines
 
@@ -27,6 +27,11 @@ class MarketTest(unittest.TestCase):
         self.assertNotIn("sma30", candles[28])
         self.assertEqual(candles[29]["sma30"], 15.5)
         self.assertEqual(candles[59]["sma60"], 30.5)
+
+    def test_insertion_stats_resets_each_minute(self) -> None:
+        stats = InsertionStats(rows=125)
+        self.assertEqual(stats.take(), 125)
+        self.assertEqual(stats.take(), 0)
 
 
 class CollectorWriterTest(unittest.IsolatedAsyncioTestCase):

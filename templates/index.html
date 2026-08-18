@@ -50,7 +50,17 @@
         </section>
 
         <section class="chart-shell">
-            <div class="chart-label price-label">PRICE · SMA 30 / 45 / 60</div>
+            <div class="ohlc-legend price-label">
+                <div><strong id="hover-symbol">BTCUSDT</strong><span id="hover-time">--</span></div>
+                <div class="ohlc-values">
+                    <span>O <b id="hover-open">--</b></span>
+                    <span>H <b id="hover-high">--</b></span>
+                    <span>L <b id="hover-low">--</b></span>
+                    <span>C <b id="hover-close">--</b></span>
+                    <span id="hover-change">--</span>
+                    <span>RANGE <b id="hover-range">--</b></span>
+                </div>
+            </div>
             <div class="chart-label volume-label">VOLUME</div>
             <div class="chart-label cvd-label">CUMULATIVE VOLUME DELTA</div>
             <div id="chart" aria-label="價格、成交量與 CVD 圖表"></div>

@@ -131,7 +131,25 @@ button, input, select { font: inherit; }
     pointer-events: none;
     font: 500 9px "IBM Plex Mono", monospace;
 }
-.price-label { top: 8px; }
+.ohlc-legend {
+    position: absolute;
+    z-index: 3;
+    top: 8px;
+    left: 14px;
+    max-width: calc(100% - 100px);
+    padding: 4px 7px;
+    color: var(--muted);
+    background: rgba(251, 252, 249, .9);
+    pointer-events: none;
+    font: 500 10px "IBM Plex Mono", monospace;
+}
+.ohlc-legend > div { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ohlc-legend strong { color: var(--ink); font-size: 11px; }
+.ohlc-values { margin-top: 3px; }
+.ohlc-values span { white-space: nowrap; }
+.ohlc-values b { color: var(--ink); font-weight: 500; }
+.ohlc-values .positive, .ohlc-values .positive b { color: var(--green); }
+.ohlc-values .negative, .ohlc-values .negative b { color: var(--red); }
 .volume-label { top: 54%; }
 .cvd-label { top: 73%; }
 
@@ -165,4 +183,6 @@ button, input, select { font: inherit; }
     .search-form button { grid-column: 1 / -1; height: 42px; border-top: 1px solid #0e6549; border-left: 0; }
     .search-form label { height: 48px; }
     .brand span { display: none; }
+    .ohlc-legend { max-width: calc(100% - 64px); font-size: 9px; }
+    .ohlc-values { gap: 5px !important; }
 }

@@ -8,7 +8,7 @@ BINANCE_REST_URL = os.getenv("BINANCE_REST_URL", "https://data-api.binance.visio
 BINANCE_WS_URL = os.getenv("BINANCE_WS_URL", "wss://data-stream.binance.vision/ws")
 QUOTE_ASSETS = {
     asset.strip().upper()
-    for asset in os.getenv("CVD_QUOTE_ASSETS", "").split(",")
+    for asset in os.getenv("CVD_QUOTE_ASSETS", "USDT").split(",")
     if asset.strip()
 }
 SYMBOLS = {
