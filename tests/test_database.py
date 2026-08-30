@@ -67,6 +67,16 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(snapshot[0]["cvd"], 2.0)
         self.assertEqual([trade["tradeId"] for trade in incremental], [11])
 
+    def test_readable_view_documents_time_and_taker_side(self) -> None:
+        insert_trades(self.connection, [("BTCUSDT", 1, 1_000, 10.5, 2.0, 0)])
+
+        row = self.connection.execute("SELECT * FROM spot_trades_readable").fetchone()
+
+        self.assertEqual(row["trade_time_ms"], 1_000)
+        self.assertEqual(row["trade_time_utc"], "1970-01-01T00:00:01.000Z")
+        self.assertEqual(row["quote_quantity"], 21.0)
+        self.assertEqual(row["taker_side"], "buy")
+
 
 if __name__ == "__main__":
     unittest.main()

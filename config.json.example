@@ -1,0 +1,42 @@
+{
+  "_description": "Copy this file to config.json. Relative paths are resolved from the project directory.",
+  "database": {
+    "_description": "SQLite storage for raw Binance Spot trades.",
+    "path": "data/market.db"
+  },
+  "binance": {
+    "_description": "Public market-data endpoints; no API key is required.",
+    "rest_url": "https://data-api.binance.vision",
+    "websocket_url": "wss://data-stream.binance.vision/ws",
+    "futures_rest_url": "https://fapi.binance.com",
+    "depth_websocket_url": "wss://data-stream.binance.vision/ws"
+  },
+  "collector": {
+    "_description": "Raw Spot trade collection. Empty symbols means every matching quote asset.",
+    "auto_start": true,
+    "quote_assets": ["USDT"],
+    "symbols": [],
+    "streams_per_connection": 500,
+    "write_batch_size": 5000,
+    "queue_max_size": 200000,
+    "websocket_heartbeat_seconds": 30,
+    "reconnect_delay_seconds": 5,
+    "report_interval_seconds": 60,
+    "lock_file": "data/collector.lock"
+  },
+  "cleanup": {
+    "_description": "Retention worker. Disabled by default so collected trades are kept indefinitely.",
+    "auto_start": false,
+    "retention_days": 90,
+    "interval_seconds": 3600
+  },
+  "indicators": {
+    "_description": "Dashboard indicator parameters.",
+    "open_interest_change_length": 5
+  },
+  "server": {
+    "_description": "Local Flask server binding.",
+    "host": "127.0.0.1",
+    "port": 5000
+  }
+}

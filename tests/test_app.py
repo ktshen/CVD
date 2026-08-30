@@ -5,13 +5,12 @@ import app as app_module
 
 
 class WorkerSupervisorTest(unittest.TestCase):
+    @patch("app.process_is_running", return_value=False)
     @patch("app.subprocess.Popen")
-    def test_starts_and_stops_collector_and_cleanup(self, popen) -> None:
+    def test_starts_and_stops_collector(self, popen, process_is_running) -> None:
         collector = MagicMock()
-        cleanup = MagicMock()
         collector.poll.return_value = None
-        cleanup.poll.return_value = None
-        popen.side_effect = [collector, cleanup]
+        popen.return_value = collector
         supervisor = app_module.WorkerSupervisor()
 
         supervisor.start()
@@ -19,11 +18,17 @@ class WorkerSupervisorTest(unittest.TestCase):
 
         scripts = [call.args[0][1] for call in popen.call_args_list]
         self.assertTrue(scripts[0].endswith("collector.py"))
-        self.assertTrue(scripts[1].endswith("cleanup.py"))
         collector.terminate.assert_called_once()
-        cleanup.terminate.assert_called_once()
         collector.wait.assert_called_once_with(timeout=10)
-        cleanup.wait.assert_called_once_with(timeout=10)
+
+    @patch("app.process_is_running", return_value=True)
+    @patch("app.subprocess.Popen")
+    def test_does_not_start_an_existing_collector(self, popen, process_is_running) -> None:
+        supervisor = app_module.WorkerSupervisor()
+
+        supervisor.start()
+
+        popen.assert_not_called()
 
 
 class ApiTest(unittest.TestCase):
