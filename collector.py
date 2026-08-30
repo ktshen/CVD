@@ -9,13 +9,24 @@ from dataclasses import dataclass
 
 import aiohttp
 
-from cvd.config import BINANCE_WS_URL, DB_PATH, QUOTE_ASSETS, SYMBOLS
+from cvd.config import (
+    BINANCE_WS_URL,
+    COLLECTOR_LOCK_PATH,
+    DB_PATH,
+    QUEUE_MAX_SIZE,
+    QUOTE_ASSETS,
+    RECONNECT_DELAY_SECONDS,
+    REPORT_INTERVAL_SECONDS,
+    STREAMS_PER_CONNECTION,
+    SYMBOLS,
+    WRITE_BATCH_SIZE,
+    WS_HEARTBEAT_SECONDS,
+)
 from cvd.database import connect, initialize, insert_trades
 from cvd.market import fetch_symbols
+from cvd.process_lock import ProcessLock
 
 Trade = tuple[str, int, int, float, float, int]
-STREAMS_PER_CONNECTION = 500
-WRITE_BATCH_SIZE = 5_000
 
 
 @dataclass
@@ -75,7 +86,7 @@ async def write_batches(queue: asyncio.Queue[Trade], stats: InsertionStats | Non
 
 async def report_ingestion(stats: InsertionStats, queue: asyncio.Queue[Trade]) -> None:
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(REPORT_INTERVAL_SECONDS)
         logging.info(
             "Collector minute summary: %d new rows inserted; queue depth %d",
             stats.take(),
@@ -93,7 +104,7 @@ async def consume_streams(
     while True:
         try:
             logging.info("Connecting stream group %d (%d symbols)", connection_number, len(symbols))
-            async with session.ws_connect(BINANCE_WS_URL, heartbeat=30) as websocket:
+            async with session.ws_connect(BINANCE_WS_URL, heartbeat=WS_HEARTBEAT_SECONDS) as websocket:
                 await websocket.send_json({"method": "SUBSCRIBE", "params": streams, "id": connection_number})
                 async for message in websocket:
                     if message.type == aiohttp.WSMsgType.TEXT:
@@ -104,7 +115,7 @@ async def consume_streams(
                         break
         except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as error:
             logging.warning("Stream group %d disconnected: %s", connection_number, error)
-        await asyncio.sleep(5)
+        await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
 
 async def main() -> None:
@@ -113,7 +124,7 @@ async def main() -> None:
     if not symbols:
         raise RuntimeError("No matching Binance Spot symbols were found")
     logging.info("Collecting raw trade ticks for %d symbols", len(symbols))
-    queue: asyncio.Queue[Trade] = asyncio.Queue(maxsize=200_000)
+    queue: asyncio.Queue[Trade] = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
     stats = InsertionStats()
     writer = asyncio.create_task(write_batches(queue, stats))
     reporter = asyncio.create_task(report_ingestion(stats, queue))
@@ -135,7 +146,13 @@ async def main() -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    collector_lock = ProcessLock(COLLECTOR_LOCK_PATH)
+    if not collector_lock.acquire():
+        logging.info("Collector is already running; exiting")
+    else:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            pass
+        finally:
+            collector_lock.release()

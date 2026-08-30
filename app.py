@@ -14,7 +14,18 @@ from flask_sock import Sock
 from simple_websocket import ConnectionClosed
 from werkzeug.exceptions import HTTPException
 
-from cvd.config import BINANCE_DEPTH_WS_URL, DB_PATH, OI_CHANGE_LENGTH
+from cvd.config import (
+    BINANCE_DEPTH_WS_URL,
+    CLEANUP_AUTO_START,
+    COLLECTOR_AUTO_START,
+    COLLECTOR_LOCK_PATH,
+    DB_PATH,
+    OI_CHANGE_LENGTH,
+    QUOTE_ASSETS,
+    SERVER_HOST,
+    SERVER_PORT,
+    SYMBOLS,
+)
 from cvd.database import aggregate_cvd, connect, initialize, latest_trade_id, trades_after
 from cvd.indicators import enrich_indicators
 from cvd.market import (
@@ -25,6 +36,7 @@ from cvd.market import (
     fetch_open_interest_history,
     fetch_symbols,
 )
+from cvd.process_lock import process_is_running
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -37,9 +49,16 @@ class WorkerSupervisor:
         self.processes: list[subprocess.Popen] = []
 
     def start(self) -> None:
-        for script in ("collector.py", "cleanup.py"):
-            process = subprocess.Popen([sys.executable, str(PROJECT_ROOT / script)], cwd=PROJECT_ROOT)
-            self.processes.append(process)
+        scripts: list[str] = []
+        if COLLECTOR_AUTO_START:
+            if process_is_running(COLLECTOR_LOCK_PATH):
+                logging.info("Collector is already running; server will use the existing process")
+            else:
+                scripts.append("collector.py")
+        if CLEANUP_AUTO_START:
+            scripts.append("cleanup.py")
+        for script in scripts:
+            self.processes.append(subprocess.Popen([sys.executable, str(PROJECT_ROOT / script)], cwd=PROJECT_ROOT))
 
     def stop(self) -> None:
         for process in self.processes:
@@ -57,7 +76,7 @@ def run() -> None:
     workers = WorkerSupervisor()
     workers.start()
     try:
-        app.run(host="127.0.0.1", port=5000, debug=False)
+        app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
     finally:
         workers.stop()
 
@@ -70,7 +89,14 @@ def index():
 @app.get("/api/symbols")
 def symbols():
     try:
-        return jsonify([item for item in fetch_symbols() if item["quoteAsset"] == "USDT"])
+        return jsonify(
+            [
+                item
+                for item in fetch_symbols()
+                if (not SYMBOLS or item["symbol"] in SYMBOLS)
+                and (not QUOTE_ASSETS or item["quoteAsset"] in QUOTE_ASSETS)
+            ]
+        )
     except (urllib.error.URLError, TimeoutError, KeyError) as error:
         return jsonify({"error": f"Binance symbols unavailable: {error}"}), 502
 

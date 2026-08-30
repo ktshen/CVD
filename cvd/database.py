@@ -41,6 +41,20 @@ def initialize(db_path: str | Path = DEFAULT_DB_PATH) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_spot_trades_symbol_time
                 ON spot_trades(symbol, trade_time);
+
+            DROP VIEW IF EXISTS spot_trades_readable;
+
+            CREATE VIEW spot_trades_readable AS
+            SELECT
+                symbol,
+                trade_id,
+                trade_time AS trade_time_ms,
+                strftime('%Y-%m-%dT%H:%M:%fZ', trade_time / 1000.0, 'unixepoch') AS trade_time_utc,
+                price,
+                quantity,
+                price * quantity AS quote_quantity,
+                CASE buyer_is_maker WHEN 0 THEN 'buy' ELSE 'sell' END AS taker_side
+            FROM spot_trades;
             """
         )
     finally:
@@ -146,7 +160,7 @@ def trades_after(
 
 def cleanup_old_trades(
     connection: sqlite3.Connection,
-    retention_days: int = 5,
+    retention_days: int = 90,
     now_ms: int | None = None,
 ) -> int:
     current_ms = now_ms if now_ms is not None else int(time.time() * 1000)
