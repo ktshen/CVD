@@ -6,18 +6,53 @@ Flask + TradingView Lightweight Charts 的本地 Spot order-flow dashboard。Kli
 
 ```powershell
 python -m pip install -r requirements.txt
+python -m playwright install chromium
 Copy-Item config.json.example config.json
 python app.py
 ```
 
 請先依本機需求修改 `config.json`；此檔案已由 Git 忽略。若檔案不存在，程式會使用 `config.json.example` 所列的預設值。相對路徑以專案根目錄為基準，因此可從任何工作目錄啟動。
 
-瀏覽 `http://127.0.0.1:5000`。`app.py` 是 parent process，預設會啟動 collector：
+本機瀏覽 `http://127.0.0.1:5000`；Linux 遠端部署請瀏覽 `http://伺服器IP:5000`。預設 bind `0.0.0.0`，需確認主機 firewall / cloud security group 允許 TCP 5000；公開網路部署應使用反向代理、TLS 與存取控制。`app.py` 是 parent process，預設會啟動 collector：
 
 - `collector.py`：訂閱 Binance 所有可交易 Spot symbols 的 `<symbol>@trade` raw trade stream，依 trade ID 將每一筆成交寫入 SQLite。
 - `app.py`：Flask 頁面與 chart API。
+- `notifier.py`：每 2 秒檢查有新成交的 symbols；5m ABS 首次出現時擷取手機版 chart 並透過 Telegram Bot API 發送。
+
+`python app.py` 的啟動順序如下，terminal 會逐步顯示狀態：
+
+1. Read-only 檢查 SQLite schema。正常重啟不執行 DDL，也不取得 database write lock。
+2. 僅在首次建庫或 schema 升級時執行一次 migration，並顯示 raw rows、完成筆數與耗時。
+3. 啟動受管理的 collector；Telegram 設定完整時再啟動 notifier，兩者都會顯示 PID。
+4. Flask 開始 listen。關閉 `app.py` 時，只有上述由它啟動的 child processes 會一起停止。
+
+持續運行時，collector 每分鐘回報寫入 rows 與 queue depth；notifier 每分鐘回報追蹤 symbols、實際 evaluations、alerts、errors 與最新掃描耗時。這些摘要可用來判斷 CPU 消耗來源。
+
+## Telegram 5m ABS 即時通知
+
+BotFather 只負責建立 bot；實際發送使用 Telegram Bot API。先在 Telegram 開啟 bot、按 Start 並傳一則訊息。在私人 `config.json` 的 `notifications` 區塊填入：
+
+```json
+{
+	"notifications": {
+		"auto_start": true,
+		"bot_token": "由 BotFather 取得的新 token",
+		"chat_id": "接收通知的 chat ID"
+	}
+}
+```
+
+不知道 chat ID 時，可先只填 `bot_token`，傳訊息給 bot 後執行 `python notifier.py --discover-chat-id`。填妥兩個欄位後執行 `python app.py`，server 會自動啟動 notifier；server 關閉時也會一併停止 notifier。`config.json` 已由 Git 忽略，仍應限制檔案存取權限。已公開的 token 應先用 BotFather `/revoke` 撤銷並重發。
+
+通知目前固定監看 5m timeframe。每個有新 tick 的 symbol 都會即時重新判斷；同一 symbol、5m candle 與方向只發送一次，重啟後也不重複。圖片以 390×844 mobile viewport 擷取 5m chart，caption 包含 symbol、price、該根 tick-by-tick `price × quantity` USD volume、USD volume MA20 與 Delta Z-score。
+
+ABS 需要 100 根 Delta Z-score 歷史，因此新的資料庫需先累積至少 100 根連續 5m raw ticks（約 8 小時 20 分鐘）才會通知。這項限制避免用缺失資料製造假訊號。
 
 cleanup 預設關閉，資料會持續累積。只有將 `cleanup.auto_start` 設為 `true` 時，server 才會啟動 `cleanup.py` 並依 retention 設定刪除舊資料。
+
+正常重啟不會重建資料庫：主程序、collector 與 notifier 只做 read-only schema readiness check。只有全新資料庫或 schema 版本升級才執行 migration；terminal 會顯示 raw trade 數量、開始/完成及耗時。migration 完成前 web port 尚未開始 listen；若偵測到外部 collector 正在寫入，程式會要求先停止 collector，避免 SQLite write-lock 衝突。
+
+Linux 若已有 `config.json`，請確認 `server.host` 是 `"0.0.0.0"`；舊檔案中的 `"127.0.0.1"` 仍會覆蓋新預設，導致遠端無法連線。
 
 collector 也可獨立從 terminal 啟動：
 
@@ -60,6 +95,22 @@ Binance raw `trade` event 的 `m` 表示 buyer 是否為 maker：
 - `m=true`：seller 是 taker，quantity 計為負 delta。
 
 每個 timeframe bucket 的 delta 為 `taker buy quantity - taker sell quantity`，CVD 是畫面查詢區間內 delta 的累加。每筆 row 對應 Binance 的單一 raw trade ID，不會把多筆成交先聚合。collector 啟動前的逐筆成交不會由 Klines 還原，因此沒有本地 tick 的歷史區段不會顯示 CVD。
+
+## 效能與正式部署
+
+collector 會用 SQLite trigger 同步維護 1 分鐘 rollup；chart 的 CVD 查詢再由 minute rows 聚合成目標 timeframe，不會在每次載圖時重掃 raw ticks。既有資料庫首次升級會自動 backfill 一次。實測 161 萬 raw rows 的 500-day 查詢由約 191 ms 降到 0.12 ms；notifier 的 100×5m 查詢由約 49 ms 降到 0.30 ms。
+
+Binance Klines、OI 會並行讀取，並使用 bounded in-memory TTL cache 與 per-key request coalescing。dashboard 使用 compact JSON 與 gzip；實測 5m response 由 372.6 KB 降到 13.8 KB（傳輸大小）。即時 ticks 會在瀏覽器每 100ms 合併重繪，資料不會被抽樣或丟棄。
+
+48 CPU / 64 GB 主機建議從 8 個 web workers、每個 32 threads 開始壓測，而不是直接開 48 workers；更多 process 會複製 cache 並增加 Binance API 與 SQLite 連線。Linux 可將 worker 分開啟動：
+
+```bash
+python collector.py
+python notifier.py
+gunicorn --worker-class gthread --workers 8 --threads 32 --timeout 0 --bind 0.0.0.0:5000 app:app
+```
+
+Gunicorn 模式不會自動啟動 collector/notifier，應由 systemd、Docker Compose 或其他 supervisor 分別管理。`server.market_data_threads` 控制每個 web process 的 Binance I/O pool；`server.websocket_poll_seconds` 預設 0.1 秒，可依同時在線圖表數調高到 0.2–0.5 秒以降低 SQLite polling。正式值應以實際 concurrent users 壓測後決定。
 
 ## 容量控制
 

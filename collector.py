@@ -22,7 +22,7 @@ from cvd.config import (
     WRITE_BATCH_SIZE,
     WS_HEARTBEAT_SECONDS,
 )
-from cvd.database import connect, initialize, insert_trades
+from cvd.database import connect, ensure_database_ready, insert_trades
 from cvd.market import fetch_symbols
 from cvd.process_lock import ProcessLock
 
@@ -119,7 +119,10 @@ async def consume_streams(
 
 
 async def main() -> None:
-    initialize(DB_PATH)
+    if ensure_database_ready(DB_PATH):
+        logging.info("Database schema created or upgraded")
+    else:
+        logging.info("Database schema already current")
     symbols = await asyncio.to_thread(selected_symbols)
     if not symbols:
         raise RuntimeError("No matching Binance Spot symbols were found")

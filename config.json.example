@@ -34,9 +34,20 @@
     "_description": "Dashboard indicator parameters.",
     "open_interest_change_length": 5
   },
+  "notifications": {
+    "_description": "5m ABS Telegram alerts. Copy this file to config.json, then put the BotFather token in bot_token and the receiving Telegram chat ID in chat_id. Keep config.json private.",
+    "auto_start": true,
+    "bot_token": "",
+    "chat_id": "",
+    "poll_seconds": 2,
+    "report_interval_seconds": 60,
+    "chart_base_url": "http://127.0.0.1:5000"
+  },
   "server": {
     "_description": "Local Flask server binding.",
-    "host": "127.0.0.1",
-    "port": 5000
+    "host": "0.0.0.0",
+    "port": 5000,
+    "market_data_threads": 32,
+    "websocket_poll_seconds": 0.1
   }
 }

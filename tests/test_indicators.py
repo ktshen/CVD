@@ -8,6 +8,15 @@ class IndicatorTest(unittest.TestCase):
         result = rolling_zscore([1.0] * 100)
         self.assertEqual(result[-1], 0.0)
 
+    def test_rolling_zscore_recovers_after_missing_value_leaves_window(self) -> None:
+        values = [None] + [1.0] * 99 + [10.0]
+
+        result = rolling_zscore(values)
+
+        self.assertIsNone(result[99])
+        self.assertIsNotNone(result[100])
+        self.assertGreater(result[100], 2)
+
     def test_absorption_and_oi_context(self) -> None:
         candles = [
             {"time": index * 60, "open": 10.0, "high": 12.0, "low": 8.0, "close": 11.0, "volume": 1.0}

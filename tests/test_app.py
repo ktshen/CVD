@@ -30,6 +30,26 @@ class WorkerSupervisorTest(unittest.TestCase):
 
         popen.assert_not_called()
 
+    @patch("app.TELEGRAM_CHAT_ID", "123456")
+    @patch("app.TELEGRAM_BOT_TOKEN", "test-token")
+    @patch("app.NOTIFIER_AUTO_START", True)
+    @patch("app.COLLECTOR_AUTO_START", False)
+    @patch("app.CLEANUP_AUTO_START", False)
+    @patch("app.subprocess.Popen")
+    def test_starts_and_stops_notifier_with_server(self, popen) -> None:
+        notifier = MagicMock()
+        notifier.poll.return_value = None
+        popen.return_value = notifier
+        supervisor = app_module.WorkerSupervisor()
+
+        supervisor.start()
+        supervisor.stop()
+
+        command = popen.call_args.args[0]
+        self.assertTrue(command[1].endswith("notifier.py"))
+        notifier.terminate.assert_called_once()
+        notifier.wait.assert_called_once_with(timeout=10)
+
 
 class ApiTest(unittest.TestCase):
     @patch("app.fetch_symbols")
@@ -51,6 +71,20 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.get_json()["type"], "RuntimeError")
         self.assertIn("database exploded", response.get_json()["details"])
+
+    @patch("app.fetch_open_interest_history", return_value=[])
+    @patch("app.fetch_klines")
+    def test_compact_chart_omits_recomputed_indicator_fields(self, fetch_klines, fetch_open_interest_history) -> None:
+        fetch_klines.return_value = [
+            {"time": index * 300, "open": 10.0, "high": 12.0, "low": 8.0, "close": 11.0, "volume": 1.0}
+            for index in range(100)
+        ]
+
+        response = app_module.app.test_client().get("/api/chart?symbol=BTCUSDT&interval=5m&compact=1")
+
+        self.assertEqual(response.status_code, 200)
+        indicator = response.get_json()["indicators"][-1]
+        self.assertEqual(set(indicator), {"time", "openInterest"})
 
 
 if __name__ == "__main__":

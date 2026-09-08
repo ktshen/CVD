@@ -6,17 +6,29 @@ from collections.abc import Sequence
 
 def rolling_zscore(values: Sequence[float | None], length: int = 100) -> list[float | None]:
     result: list[float | None] = []
+    rolling_sum = 0.0
+    rolling_sum_squares = 0.0
+    missing = 0
     for index, value in enumerate(values):
-        if value is None or index + 1 < length:
+        if value is None:
+            missing += 1
+        else:
+            numeric_value = float(value)
+            rolling_sum += numeric_value
+            rolling_sum_squares += numeric_value * numeric_value
+        if index >= length:
+            expired = values[index - length]
+            if expired is None:
+                missing -= 1
+            else:
+                numeric_expired = float(expired)
+                rolling_sum -= numeric_expired
+                rolling_sum_squares -= numeric_expired * numeric_expired
+        if index + 1 < length or missing or value is None:
             result.append(None)
             continue
-        window = values[index - length + 1 : index + 1]
-        if any(item is None for item in window):
-            result.append(None)
-            continue
-        numeric = [float(item) for item in window if item is not None]
-        mean = sum(numeric) / length
-        variance = sum((item - mean) ** 2 for item in numeric) / length
+        mean = rolling_sum / length
+        variance = max(rolling_sum_squares / length - mean * mean, 0.0)
         std = math.sqrt(variance)
         result.append(0.0 if std == 0 else (float(value) - mean) / std)
     return result
