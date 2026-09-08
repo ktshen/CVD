@@ -43,6 +43,8 @@ let orderBookSocket = null;
 let socketGeneration = 0;
 let bookGeneration = 0;
 let oiTimer = null;
+let tradeRenderTimer = null;
+let pendingTrades = [];
 
 chart.panes()[0].setStretchFactor(5);
 chart.panes()[1].setStretchFactor(1.2);
@@ -86,12 +88,26 @@ function calculateSma(items, period) {
 }
 
 function rollingZScore(values, length = 100) {
+    let rollingSum = 0;
+    let rollingSumSquares = 0;
+    let missing = 0;
     return values.map((value, index) => {
-        if (value === null || index + 1 < length) return null;
-        const window = values.slice(index - length + 1, index + 1);
-        if (window.some(item => item === null)) return null;
-        const mean = window.reduce((total, item) => total + item, 0) / length;
-        const variance = window.reduce((total, item) => total + (item - mean) ** 2, 0) / length;
+        if (value === null) missing += 1;
+        else {
+            rollingSum += value;
+            rollingSumSquares += value * value;
+        }
+        if (index >= length) {
+            const expired = values[index - length];
+            if (expired === null) missing -= 1;
+            else {
+                rollingSum -= expired;
+                rollingSumSquares -= expired * expired;
+            }
+        }
+        if (index + 1 < length || missing || value === null) return null;
+        const mean = rollingSum / length;
+        const variance = Math.max(rollingSumSquares / length - mean * mean, 0);
         const std = Math.sqrt(variance);
         return std === 0 ? 0 : (value - mean) / std;
     });
@@ -284,6 +300,17 @@ function applyTrades(trades) {
     updateHover(marketState.candles.at(-1));
 }
 
+function enqueueTrades(trades) {
+    pendingTrades.push(...trades);
+    if (tradeRenderTimer !== null) return;
+    tradeRenderTimer = setTimeout(() => {
+        const batch = pendingTrades;
+        pendingTrades = [];
+        tradeRenderTimer = null;
+        if (batch.length) applyTrades(batch);
+    }, 100);
+}
+
 function connectMarketSocket() {
     const generation = ++socketGeneration;
     if (marketSocket) marketSocket.close();
@@ -298,7 +325,7 @@ function connectMarketSocket() {
             message.textContent = payload.error.split('\n').at(-2) || payload.error;
             return;
         }
-        if (payload.type === 'trades' && payload.symbol === marketState.symbol) applyTrades(payload.trades);
+        if (payload.type === 'trades' && payload.symbol === marketState.symbol) enqueueTrades(payload.trades);
     });
     marketSocket.addEventListener('close', () => {
         if (generation !== socketGeneration) return;
@@ -369,17 +396,21 @@ async function refreshOpenInterest() {
 async function loadChart() {
     const symbol = symbolInput.value.trim().toUpperCase();
     if (!symbol) return;
+    document.body.dataset.chartReady = 'false';
     symbolInput.value = symbol;
     socketGeneration += 1;
     bookGeneration += 1;
     if (marketSocket) marketSocket.close();
     if (orderBookSocket) orderBookSocket.close();
     if (oiTimer) clearInterval(oiTimer);
+    if (tradeRenderTimer !== null) clearTimeout(tradeRenderTimer);
+    tradeRenderTimer = null;
+    pendingTrades = [];
     loadButton.disabled = true;
     message.textContent = `${symbol} · ${intervalInput.value} 資料載入中`;
     setStatus('', '同步中');
     try {
-        const params = new URLSearchParams({ symbol, interval: intervalInput.value, limit: '500' });
+        const params = new URLSearchParams({ symbol, interval: intervalInput.value, limit: '500', compact: '1' });
         const response = await fetch(`/api/chart?${params}`);
         const data = await response.json();
         if (!response.ok) throw new Error([data.error, data.details].filter(Boolean).join('\n'));
@@ -388,6 +419,7 @@ async function loadChart() {
         renderSeries(true);
         updateSummary();
         updateHover(marketState.candles.at(-1));
+        document.body.dataset.chartReady = 'true';
         message.textContent = data.cvd.length
             ? 'Klines: Binance REST · 即時更新: local raw-trade WebSocket'
             : 'Klines 已載入；等待本地 collector 累積此交易對資料';
@@ -443,4 +475,9 @@ fetch('/api/symbols')
         message.textContent = `Symbols 載入失敗: ${error.message}`;
     });
 
+const initialParams = new URLSearchParams(location.search);
+const initialSymbol = initialParams.get('symbol')?.trim().toUpperCase();
+const initialInterval = initialParams.get('interval');
+if (initialSymbol) symbolInput.value = initialSymbol;
+if ([...intervalInput.options].some(option => option.value === initialInterval)) intervalInput.value = initialInterval;
 loadChart();

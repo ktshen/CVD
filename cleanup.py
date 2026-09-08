@@ -5,11 +5,11 @@ import logging
 import time
 
 from cvd.config import CLEANUP_INTERVAL_SECONDS, DB_PATH, RETENTION_DAYS
-from cvd.database import cleanup_old_trades, connect, initialize
+from cvd.database import cleanup_old_trades, connect, ensure_database_ready
 
 
 def clean_once() -> int:
-    initialize(DB_PATH)
+    ensure_database_ready(DB_PATH)
     connection = connect(DB_PATH)
     try:
         return cleanup_old_trades(connection, RETENTION_DAYS)

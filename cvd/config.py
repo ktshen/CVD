@@ -29,7 +29,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cleanup": {"auto_start": False, "retention_days": 90, "interval_seconds": 3_600},
     "indicators": {"open_interest_change_length": 5},
-    "server": {"host": "127.0.0.1", "port": 5_000},
+    "notifications": {
+        "auto_start": True,
+        "bot_token": "",
+        "chat_id": "",
+        "poll_seconds": 2,
+        "report_interval_seconds": 60,
+        "chart_base_url": "http://127.0.0.1:5000",
+    },
+    "server": {"host": "0.0.0.0", "port": 5_000, "market_data_threads": 32, "websocket_poll_seconds": 0.1},
 }
 
 
@@ -83,5 +91,13 @@ CLEANUP_AUTO_START = bool(CONFIG["cleanup"]["auto_start"])
 RETENTION_DAYS = int(CONFIG["cleanup"]["retention_days"])
 CLEANUP_INTERVAL_SECONDS = int(CONFIG["cleanup"]["interval_seconds"])
 OI_CHANGE_LENGTH = int(CONFIG["indicators"]["open_interest_change_length"])
+NOTIFIER_AUTO_START = bool(CONFIG["notifications"]["auto_start"])
+NOTIFIER_POLL_SECONDS = float(CONFIG["notifications"]["poll_seconds"])
+NOTIFIER_REPORT_INTERVAL_SECONDS = float(CONFIG["notifications"]["report_interval_seconds"])
+NOTIFIER_CHART_BASE_URL = str(CONFIG["notifications"]["chart_base_url"]).rstrip("/")
+TELEGRAM_BOT_TOKEN = str(CONFIG["notifications"]["bot_token"]).strip()
+TELEGRAM_CHAT_ID = str(CONFIG["notifications"]["chat_id"]).strip()
 SERVER_HOST = str(CONFIG["server"]["host"])
 SERVER_PORT = int(CONFIG["server"]["port"])
+MARKET_DATA_THREADS = int(CONFIG["server"]["market_data_threads"])
+WEBSOCKET_POLL_SECONDS = float(CONFIG["server"]["websocket_poll_seconds"])

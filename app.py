@@ -7,9 +7,11 @@ import sys
 import time
 import traceback
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
+from flask_compress import Compress
 from flask_sock import Sock
 from simple_websocket import ConnectionClosed
 from werkzeug.exceptions import HTTPException
@@ -20,13 +22,25 @@ from cvd.config import (
     COLLECTOR_AUTO_START,
     COLLECTOR_LOCK_PATH,
     DB_PATH,
+    MARKET_DATA_THREADS,
+    NOTIFIER_AUTO_START,
     OI_CHANGE_LENGTH,
     QUOTE_ASSETS,
     SERVER_HOST,
     SERVER_PORT,
     SYMBOLS,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    WEBSOCKET_POLL_SECONDS,
 )
-from cvd.database import aggregate_cvd, connect, initialize, latest_trade_id, trades_after
+from cvd.database import (
+    aggregate_cvd_from_minutes,
+    connect,
+    ensure_database_ready,
+    latest_trade_id,
+    minute_rollup_migration_required,
+    trades_after,
+)
 from cvd.indicators import enrich_indicators
 from cvd.market import (
     INTERVALS_MS,
@@ -39,9 +53,11 @@ from cvd.market import (
 from cvd.process_lock import process_is_running
 
 app = Flask(__name__)
+app.config["COMPRESS_MIN_SIZE"] = 1_024
+Compress(app)
 sock = Sock(app)
-initialize(DB_PATH)
 PROJECT_ROOT = Path(__file__).resolve().parent
+MARKET_EXECUTOR = ThreadPoolExecutor(max_workers=MARKET_DATA_THREADS, thread_name_prefix="market-data")
 
 
 class WorkerSupervisor:
@@ -57,12 +73,19 @@ class WorkerSupervisor:
                 scripts.append("collector.py")
         if CLEANUP_AUTO_START:
             scripts.append("cleanup.py")
+        if NOTIFIER_AUTO_START and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            scripts.append("notifier.py")
+        elif NOTIFIER_AUTO_START:
+            logging.warning("ABS notifier disabled: set notifications.bot_token and notifications.chat_id in config.json")
         for script in scripts:
-            self.processes.append(subprocess.Popen([sys.executable, str(PROJECT_ROOT / script)], cwd=PROJECT_ROOT))
+            process = subprocess.Popen([sys.executable, str(PROJECT_ROOT / script)], cwd=PROJECT_ROOT)
+            self.processes.append(process)
+            logging.info("Started %s (PID %d)", script, process.pid)
 
     def stop(self) -> None:
         for process in self.processes:
             if process.poll() is None:
+                logging.info("Stopping worker PID %d", process.pid)
                 process.terminate()
         for process in self.processes:
             try:
@@ -73,11 +96,33 @@ class WorkerSupervisor:
 
 
 def run() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.info(
+        "Startup plan: collector=%s, notifier=%s, cleanup=%s",
+        "enabled" if COLLECTOR_AUTO_START else "disabled",
+        "enabled" if NOTIFIER_AUTO_START and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "disabled",
+        "enabled" if CLEANUP_AUTO_START else "disabled (raw ticks retained)",
+    )
+    if minute_rollup_migration_required(DB_PATH) and process_is_running(COLLECTOR_LOCK_PATH):
+        raise RuntimeError(
+            "A one-time database migration is required while an external collector is running. "
+            "Stop collector.py, then start app.py again; app.py will migrate first and restart its managed collector."
+        )
+    logging.info("Preparing database at %s", DB_PATH)
+    started_at = time.monotonic()
+    changed = ensure_database_ready(DB_PATH)
+    logging.info(
+        "Database ready in %.2f seconds (%s)",
+        time.monotonic() - started_at,
+        "schema created or upgraded" if changed else "schema already current; no write lock used",
+    )
     workers = WorkerSupervisor()
     workers.start()
     try:
+        logging.info("Starting web server at http://%s:%d", SERVER_HOST, SERVER_PORT)
         app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
     finally:
+        logging.info("Stopping managed workers")
         workers.stop()
 
 
@@ -114,8 +159,10 @@ def chart_data():
     if interval not in INTERVALS_MS:
         return jsonify({"error": "Unsupported interval"}), 400
 
+    candles_future = MARKET_EXECUTOR.submit(fetch_klines, symbol, interval, limit)
+    oi_future = MARKET_EXECUTOR.submit(fetch_open_interest_history, symbol, interval, limit)
     try:
-        candles = fetch_klines(symbol, interval, limit)
+        candles = candles_future.result()
     except urllib.error.HTTPError as error:
         status = 400 if error.code == 400 else 502
         return jsonify({"error": f"Binance rejected the request ({error.code})"}), status
@@ -129,24 +176,33 @@ def chart_data():
     end_ms = max(int(time.time() * 1000) + 1, (int(candles[-1]["time"]) * 1000) + interval_ms)
     connection = connect(DB_PATH)
     try:
+        connection.execute("BEGIN")
         checkpoint = latest_trade_id(connection, symbol)
-        cvd = aggregate_cvd(connection, symbol, interval_ms, start_ms, end_ms, checkpoint)
+        cvd = aggregate_cvd_from_minutes(connection, symbol, interval_ms, start_ms, end_ms)
+        connection.commit()
     finally:
         connection.close()
     oi_error = None
     try:
-        oi_history = fetch_open_interest_history(symbol, interval, limit)
+        oi_history = oi_future.result()
     except Exception as error:
         logging.warning("Open interest unavailable for %s: %s", symbol, error)
         oi_history = []
         oi_error = f"{type(error).__name__}: {error}"
     deltas_by_time = {int(row["time"]): float(row["delta"]) for row in cvd}
-    indicators = enrich_indicators(
-        candles,
-        deltas_by_time,
-        align_open_interest(candles, oi_history),
-        OI_CHANGE_LENGTH,
-    )
+    open_interest_by_time = align_open_interest(candles, oi_history)
+    compact = request.args.get("compact") == "1"
+    if compact:
+        indicators = [
+            {"time": candle["time"], "openInterest": open_interest_by_time.get(int(candle["time"]))}
+            for candle in candles
+        ]
+        candles = [
+            {key: candle[key] for key in ("time", "open", "high", "low", "close", "volume")}
+            for candle in candles
+        ]
+    else:
+        indicators = enrich_indicators(candles, deltas_by_time, open_interest_by_time, OI_CHANGE_LENGTH)
     return jsonify(
         {
             "symbol": symbol,
@@ -188,7 +244,7 @@ def market_socket(websocket):
             if rows:
                 trade_id = int(rows[-1]["tradeId"])
                 websocket.send(json.dumps({"type": "trades", "symbol": symbol, "trades": rows}))
-            time.sleep(0.05)
+            time.sleep(WEBSOCKET_POLL_SECONDS)
     except ConnectionClosed:
         return
     except Exception:

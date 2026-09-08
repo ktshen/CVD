@@ -2,15 +2,36 @@ import asyncio
 import contextlib
 import unittest
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
 
 from collector import InsertionStats, parse_trade, write_batches
 from cvd.database import connect, initialize
-from cvd.market import align_open_interest, fetch_klines
+from cvd.market import TtlCache, align_open_interest, fetch_klines
 
 
 class MarketTest(unittest.TestCase):
+    def test_ttl_cache_coalesces_concurrent_loads(self) -> None:
+        cache = TtlCache(ttl_seconds=10, max_size=10)
+        calls = 0
+        lock = threading.Lock()
+
+        def load() -> str:
+            nonlocal calls
+            with lock:
+                calls += 1
+            time.sleep(0.05)
+            return "loaded"
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(lambda _: cache.get_or_load("key", load), range(8)))
+
+        self.assertEqual(results, ["loaded"] * 8)
+        self.assertEqual(calls, 1)
+
     def test_parse_raw_trade_preserves_maker_flag(self) -> None:
         trade = parse_trade(
             {"e": "trade", "s": "BTCUSDT", "t": 42, "T": 1000, "p": "10.5", "q": "2.25", "m": True}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import BinaryIO
 
@@ -10,7 +11,16 @@ class ProcessLock:
         self.path = Path(path)
         self.file: BinaryIO | None = None
 
-    def acquire(self) -> bool:
+    def acquire(self, timeout_seconds: float = 0) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if self._try_acquire():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.1, max(deadline - time.monotonic(), 0)))
+
+    def _try_acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_file = self.path.open("a+b")
         lock_file.seek(0, os.SEEK_END)

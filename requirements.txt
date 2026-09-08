@@ -1,3 +1,6 @@
 aiohttp>=3.11,<4
 Flask>=3.1,<4
+Flask-Compress>=1.18,<2
 flask-sock>=0.7,<1
+gunicorn>=23,<24; platform_system != "Windows"
+playwright>=1.55,<2
