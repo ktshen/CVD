@@ -32,50 +32,62 @@ from cvd.database import (
 from cvd.indicators import rolling_zscore
 from cvd.market import INTERVALS_MS
 
-INTERVAL = "5m"
-INTERVAL_MS = INTERVALS_MS[INTERVAL]
+TIMEFRAME_VOLUME_THRESHOLDS = {
+    "1m": 20_000.0,
+    "5m": 50_000.0,
+}
 ZSCORE_LENGTH = 100
 
 
 @dataclass(frozen=True)
 class AbsSignal:
     symbol: str
+    interval: str
     bucket_time: int
     direction: str
     price: float
     usd_volume: float
     usd_volume_ma20: float
     delta_z: float
+    volume_threshold: float
+
+    @property
+    def notification_key(self) -> str:
+        return f"{self.interval}:{self.direction}"
 
 
-def detect_abs_signal(symbol: str, buckets: list[dict[str, float | int]]) -> AbsSignal | None:
+def detect_abs_signal(
+    symbol: str,
+    interval: str,
+    buckets: list[dict[str, float | int]],
+    usd_volume_threshold: float,
+) -> AbsSignal | None:
     if len(buckets) < ZSCORE_LENGTH:
         return None
     recent = buckets[-ZSCORE_LENGTH:]
-    expected_step = INTERVAL_MS // 1000
+    expected_step = INTERVALS_MS[interval] // 1000
     if any(int(right["time"]) - int(left["time"]) != expected_step for left, right in zip(recent, recent[1:])):
         return None
     delta_z = rolling_zscore([float(bucket["delta"]) for bucket in recent])[-1]
     latest = recent[-1]
     price_range = float(latest["high"]) - float(latest["low"])
     close_position = 0.5 if price_range == 0 else (float(latest["close"]) - float(latest["low"])) / price_range
-    direction = None
-    if delta_z is not None and delta_z < -2 and close_position > 0.55:
-        direction = "bullish"
-    elif delta_z is not None and delta_z > 2 and close_position < 0.45:
-        direction = "bearish"
-    if direction is None:
-        return None
     usd_volume = float(latest["usdVolume"])
+    if usd_volume <= usd_volume_threshold:
+        return None
+    if delta_z is None or delta_z >= -2 or close_position <= 0.55:
+        return None
     usd_volume_ma20 = sum(float(bucket["usdVolume"]) for bucket in recent[-20:]) / 20
     return AbsSignal(
         symbol=symbol,
+        interval=interval,
         bucket_time=int(latest["time"]),
-        direction=direction,
+        direction="bullish",
         price=float(latest["close"]),
         usd_volume=usd_volume,
         usd_volume_ma20=usd_volume_ma20,
         delta_z=float(delta_z),
+        volume_threshold=usd_volume_threshold,
     )
 
 
@@ -199,14 +211,14 @@ class MobileChartCapture:
         if self.playwright is not None:
             self.playwright.stop()
 
-    def capture(self, symbol: str, output_path: Path) -> None:
+    def capture(self, symbol: str, interval: str, output_path: Path) -> None:
         assert self.browser is not None
         page = self.browser.new_page(
             viewport={"width": 390, "height": 844},
             device_scale_factor=2,
             is_mobile=True,
         )
-        query = urllib.parse.urlencode({"symbol": symbol, "interval": INTERVAL, "snapshot": "1"})
+        query = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "snapshot": "1"})
         try:
             page.goto(f"{self.base_url}/?{query}", wait_until="domcontentloaded", timeout=30_000)
             page.locator('body[data-chart-ready="true"]').wait_for(timeout=30_000)
@@ -223,10 +235,11 @@ def signal_caption(signal: AbsSignal) -> str:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(signal.bucket_time))
     return "\n".join(
         [
-            f"5m {signal.direction.upper()} ABS",
+            f"{signal.interval} {signal.direction.upper()} ABS",
             f"Symbol: {signal.symbol}",
             f"Price: {signal.price:,.8f}",
             f"USD volume: {format_usd(signal.usd_volume)}",
+            f"USD volume threshold: {format_usd(signal.volume_threshold)}",
             f"USD volume MA20: {format_usd(signal.usd_volume_ma20)}",
             f"Delta Z-score: {signal.delta_z:.3f}",
             f"Candle: {timestamp}",
@@ -234,10 +247,11 @@ def signal_caption(signal: AbsSignal) -> str:
     )
 
 
-def evaluate_symbol(connection, symbol: str) -> AbsSignal | None:
-    current_bucket_ms = int(time.time() * 1000) // INTERVAL_MS * INTERVAL_MS
-    start_ms = current_bucket_ms - (ZSCORE_LENGTH - 1) * INTERVAL_MS
-    buckets = recent_trade_buckets_from_minutes(connection, symbol, INTERVAL_MS, start_ms, ZSCORE_LENGTH)
+def evaluate_symbol(connection, symbol: str, interval: str) -> AbsSignal | None:
+    interval_ms = INTERVALS_MS[interval]
+    current_bucket_ms = int(time.time() * 1000) // interval_ms * interval_ms
+    start_ms = current_bucket_ms - (ZSCORE_LENGTH - 1) * interval_ms
+    buckets = recent_trade_buckets_from_minutes(connection, symbol, interval_ms, start_ms, ZSCORE_LENGTH)
     if not buckets or int(buckets[-1]["time"]) * 1000 != current_bucket_ms:
         return None
     first_bucket = connection.execute(
@@ -248,7 +262,7 @@ def evaluate_symbol(connection, symbol: str) -> AbsSignal | None:
         return None
     by_time = {int(bucket["time"]): bucket for bucket in buckets}
     dense_buckets: list[dict[str, float | int]] = []
-    for bucket_ms in range(start_ms, current_bucket_ms + INTERVAL_MS, INTERVAL_MS):
+    for bucket_ms in range(start_ms, current_bucket_ms + interval_ms, interval_ms):
         bucket_time = bucket_ms // 1000
         dense_buckets.append(
             by_time.get(
@@ -265,7 +279,7 @@ def evaluate_symbol(connection, symbol: str) -> AbsSignal | None:
                 },
             )
         )
-    return detect_abs_signal(symbol, dense_buckets)
+    return detect_abs_signal(symbol, interval, dense_buckets, TIMEFRAME_VOLUME_THRESHOLDS[interval])
 
 
 def diagnose() -> None:
@@ -274,31 +288,43 @@ def diagnose() -> None:
     try:
         markers = latest_symbol_markers(connection)
         latest_trade_time = connection.execute("SELECT MAX(trade_time) FROM spot_trades").fetchone()[0]
-        current_bucket_ms = int(time.time() * 1000) // INTERVAL_MS * INTERVAL_MS
-        history_start_ms = current_bucket_ms - (ZSCORE_LENGTH - 1) * INTERVAL_MS
-        eligible = int(
-            connection.execute(
-                """
-                SELECT COUNT(*) FROM (
-                    SELECT symbol FROM spot_trade_minutes
-                    GROUP BY symbol
-                    HAVING MIN(bucket_time) <= ? AND MAX(bucket_time) >= ?
-                )
-                """,
-                (history_start_ms, current_bucket_ms),
-            ).fetchone()[0]
-        )
-        signals = [signal for symbol in markers if (signal := evaluate_symbol(connection, symbol)) is not None]
+        diagnostics = []
+        signals = []
+        for interval, threshold in TIMEFRAME_VOLUME_THRESHOLDS.items():
+            interval_ms = INTERVALS_MS[interval]
+            current_bucket_ms = int(time.time() * 1000) // interval_ms * interval_ms
+            history_start_ms = current_bucket_ms - (ZSCORE_LENGTH - 1) * interval_ms
+            eligible = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT symbol FROM spot_trade_minutes
+                        GROUP BY symbol
+                        HAVING MIN(bucket_time) <= ? AND MAX(bucket_time) >= ?
+                    )
+                    """,
+                    (history_start_ms, current_bucket_ms),
+                ).fetchone()[0]
+            )
+            interval_signals = [
+                signal for symbol in markers if (signal := evaluate_symbol(connection, symbol, interval)) is not None
+            ]
+            diagnostics.append((interval, threshold, eligible, len(interval_signals)))
+            signals.extend(interval_signals)
         notifications = int(connection.execute("SELECT COUNT(*) FROM abs_notifications").fetchone()[0])
         age = None if latest_trade_time is None else (int(time.time() * 1000) - int(latest_trade_time)) / 1000
         print(f"Database: {DB_PATH}")
         print(f"Tracked symbols: {len(markers)}")
         print(f"Latest tick age: {'none' if age is None else f'{age:.1f} seconds'}")
-        print(f"Symbols with complete 100x5m collection window: {eligible}")
+        for interval, threshold, eligible, signal_count in diagnostics:
+            print(
+                f"{interval}: symbols with complete 100-bar collection window: {eligible}; "
+                f"bullish ABS above {format_usd(threshold)}: {signal_count}"
+            )
         print(f"Current ABS signals: {len(signals)}")
         print(f"Recorded notifications: {notifications}")
         for signal in signals:
-            print(f"  {signal.symbol} {signal.direction} deltaZ={signal.delta_z:.3f}")
+            print(f"  {signal.symbol} {signal.interval} {signal.direction} deltaZ={signal.delta_z:.3f}")
     finally:
         connection.close()
 
@@ -328,7 +354,13 @@ def monitor() -> None:
     try:
         wait_for_dashboard()
         with MobileChartCapture(NOTIFIER_CHART_BASE_URL) as capture:
-            logging.info("Monitoring all collected symbols for live 5m ABS signals")
+            logging.info(
+                "Monitoring all collected symbols for live bullish ABS signals: %s",
+                ", ".join(
+                    f"{interval} USD volume > {format_usd(threshold)}"
+                    for interval, threshold in TIMEFRAME_VOLUME_THRESHOLDS.items()
+                ),
+            )
             report_started = time.monotonic()
             evaluated = 0
             sent = 0
@@ -341,22 +373,24 @@ def monitor() -> None:
                         continue
                     evaluated += 1
                     try:
-                        signal = evaluate_symbol(connection, symbol)
-                        if signal is not None and not notification_was_sent(
-                            connection, signal.symbol, signal.bucket_time, signal.direction
-                        ):
+                        for interval in TIMEFRAME_VOLUME_THRESHOLDS:
+                            signal = evaluate_symbol(connection, symbol, interval)
+                            if signal is None or notification_was_sent(
+                                connection, signal.symbol, signal.bucket_time, signal.notification_key
+                            ):
+                                continue
                             with tempfile.TemporaryDirectory() as temp_dir:
-                                screenshot = Path(temp_dir) / f"{signal.symbol}-5m-abs.png"
-                                capture.capture(signal.symbol, screenshot)
+                                screenshot = Path(temp_dir) / f"{signal.symbol}-{signal.interval}-abs.png"
+                                capture.capture(signal.symbol, signal.interval, screenshot)
                                 send_telegram_photo(
                                     TELEGRAM_BOT_TOKEN,
                                     TELEGRAM_CHAT_ID,
                                     screenshot,
                                     signal_caption(signal),
                                 )
-                            record_notification(connection, signal.symbol, signal.bucket_time, signal.direction)
+                            record_notification(connection, signal.symbol, signal.bucket_time, signal.notification_key)
                             sent += 1
-                            logging.info("Sent %s 5m ABS alert for %s", signal.direction, signal.symbol)
+                            logging.info("Sent %s %s ABS alert for %s", signal.interval, signal.direction, signal.symbol)
                         seen_markers[symbol] = marker
                     except Exception:
                         errors += 1
