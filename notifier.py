@@ -91,6 +91,45 @@ def telegram_json(method: str, token: str) -> object:
     return payload["result"]
 
 
+def telegram_post_json(method: str, token: str, data: dict[str, str]) -> object:
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=json.dumps(data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            description = json.load(error).get("description", str(error))
+        except (json.JSONDecodeError, AttributeError):
+            description = str(error)
+        raise RuntimeError(f"Telegram {method} failed: {description}") from error
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Telegram {method} failed: {type(error).__name__}") from error
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram {method} failed: {payload.get('description', 'unknown error')}")
+    return payload["result"]
+
+
+def validate_telegram_destination() -> None:
+    telegram_post_json("getChat", TELEGRAM_BOT_TOKEN, {"chat_id": TELEGRAM_CHAT_ID})
+    logging.info("Telegram destination validated (chat ID ending in %s)", TELEGRAM_CHAT_ID[-4:])
+
+
+def send_test_message() -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Set notifications.bot_token and notifications.chat_id in config.json")
+    validate_telegram_destination()
+    telegram_post_json(
+        "sendMessage",
+        TELEGRAM_BOT_TOKEN,
+        {"chat_id": TELEGRAM_CHAT_ID, "text": "CVD notifier test: Telegram delivery is working."},
+    )
+    print("Telegram test message sent successfully.")
+
+
 def send_telegram_photo(token: str, chat_id: str, photo_path: Path, caption: str) -> None:
     boundary = uuid.uuid4().hex
     photo = photo_path.read_bytes()
@@ -199,7 +238,69 @@ def evaluate_symbol(connection, symbol: str) -> AbsSignal | None:
     current_bucket_ms = int(time.time() * 1000) // INTERVAL_MS * INTERVAL_MS
     start_ms = current_bucket_ms - (ZSCORE_LENGTH - 1) * INTERVAL_MS
     buckets = recent_trade_buckets_from_minutes(connection, symbol, INTERVAL_MS, start_ms, ZSCORE_LENGTH)
-    return detect_abs_signal(symbol, buckets)
+    if not buckets or int(buckets[-1]["time"]) * 1000 != current_bucket_ms:
+        return None
+    first_bucket = connection.execute(
+        "SELECT MIN(bucket_time) FROM spot_trade_minutes WHERE symbol = ?",
+        (symbol.upper(),),
+    ).fetchone()[0]
+    if first_bucket is None or int(first_bucket) > start_ms:
+        return None
+    by_time = {int(bucket["time"]): bucket for bucket in buckets}
+    dense_buckets: list[dict[str, float | int]] = []
+    for bucket_ms in range(start_ms, current_bucket_ms + INTERVAL_MS, INTERVAL_MS):
+        bucket_time = bucket_ms // 1000
+        dense_buckets.append(
+            by_time.get(
+                bucket_time,
+                {
+                    "time": bucket_time,
+                    "open": 0.0,
+                    "high": 0.0,
+                    "low": 0.0,
+                    "close": 0.0,
+                    "volume": 0.0,
+                    "usdVolume": 0.0,
+                    "delta": 0.0,
+                },
+            )
+        )
+    return detect_abs_signal(symbol, dense_buckets)
+
+
+def diagnose() -> None:
+    ensure_database_ready(DB_PATH)
+    connection = connect(DB_PATH)
+    try:
+        markers = latest_symbol_markers(connection)
+        latest_trade_time = connection.execute("SELECT MAX(trade_time) FROM spot_trades").fetchone()[0]
+        current_bucket_ms = int(time.time() * 1000) // INTERVAL_MS * INTERVAL_MS
+        history_start_ms = current_bucket_ms - (ZSCORE_LENGTH - 1) * INTERVAL_MS
+        eligible = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT symbol FROM spot_trade_minutes
+                    GROUP BY symbol
+                    HAVING MIN(bucket_time) <= ? AND MAX(bucket_time) >= ?
+                )
+                """,
+                (history_start_ms, current_bucket_ms),
+            ).fetchone()[0]
+        )
+        signals = [signal for symbol in markers if (signal := evaluate_symbol(connection, symbol)) is not None]
+        notifications = int(connection.execute("SELECT COUNT(*) FROM abs_notifications").fetchone()[0])
+        age = None if latest_trade_time is None else (int(time.time() * 1000) - int(latest_trade_time)) / 1000
+        print(f"Database: {DB_PATH}")
+        print(f"Tracked symbols: {len(markers)}")
+        print(f"Latest tick age: {'none' if age is None else f'{age:.1f} seconds'}")
+        print(f"Symbols with complete 100x5m collection window: {eligible}")
+        print(f"Current ABS signals: {len(signals)}")
+        print(f"Recorded notifications: {notifications}")
+        for signal in signals:
+            print(f"  {signal.symbol} {signal.direction} deltaZ={signal.delta_z:.3f}")
+    finally:
+        connection.close()
 
 
 def wait_for_dashboard() -> None:
@@ -221,6 +322,7 @@ def monitor() -> None:
         logging.info("Database schema created or upgraded")
     else:
         logging.info("Database schema already current")
+    validate_telegram_destination()
     connection = connect(DB_PATH)
     seen_markers: dict[str, int] = {}
     try:
@@ -299,9 +401,15 @@ def discover_chat_ids() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitor live 5m ABS signals and notify Telegram")
     parser.add_argument("--discover-chat-id", action="store_true")
+    parser.add_argument("--test-telegram", action="store_true")
+    parser.add_argument("--diagnose", action="store_true")
     args = parser.parse_args()
     if args.discover_chat_id:
         discover_chat_ids()
+    elif args.test_telegram:
+        send_test_message()
+    elif args.diagnose:
+        diagnose()
     else:
         monitor()
 
