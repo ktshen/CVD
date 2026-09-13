@@ -17,7 +17,7 @@ python app.py
 
 - `collector.py`：訂閱 Binance 所有可交易 Spot symbols 的 `<symbol>@trade` raw trade stream，依 trade ID 將每一筆成交寫入 SQLite。
 - `app.py`：Flask 頁面與 chart API。
-- `notifier.py`：每 2 秒檢查有新成交的 symbols；5m ABS 首次出現時擷取手機版 chart 並透過 Telegram Bot API 發送。
+- `notifier.py`：每 2 秒檢查有新成交的 symbols；1m/5m bullish ABS 符合 USD volume 門檻時擷取手機版 chart 並透過 Telegram Bot API 發送。
 
 `python app.py` 的啟動順序如下，terminal 會逐步顯示狀態：
 
@@ -28,7 +28,7 @@ python app.py
 
 持續運行時，collector 每分鐘回報寫入 rows 與 queue depth；notifier 每分鐘回報追蹤 symbols、實際 evaluations、alerts、errors 與最新掃描耗時。這些摘要可用來判斷 CPU 消耗來源。
 
-## Telegram 5m ABS 即時通知
+## Telegram ABS 即時通知
 
 BotFather 只負責建立 bot；實際發送使用 Telegram Bot API。先在 Telegram 開啟 bot、按 Start 並傳一則訊息。在私人 `config.json` 的 `notifications` 區塊填入：
 
@@ -54,7 +54,7 @@ python notifier.py --discover-chat-id
 python notifier.py --test-telegram
 ```
 
-檢查 remote machine 的 tick 新鮮度、100×5m 歷史覆蓋、當前 ABS 與已發送紀錄：
+檢查 remote machine 的 tick 新鮮度、1m/5m 歷史覆蓋、當前 ABS 與已發送紀錄：
 
 ```bash
 python notifier.py --diagnose
@@ -62,7 +62,12 @@ python notifier.py --diagnose
 
 填妥兩個欄位後執行 `python app.py`，server 會自動啟動 notifier；server 關閉時也會一併停止 notifier。notifier 啟動時會先驗證 Telegram destination，錯誤時直接退出並顯示 Telegram 原因。`config.json` 已由 Git 忽略，仍應限制檔案存取權限。已公開的 token 應先用 BotFather `/revoke` 撤銷並重發。
 
-通知目前固定監看 5m timeframe。每個有新 tick 的 symbol 都會即時重新判斷；同一 symbol、5m candle 與方向只發送一次，重啟後也不重複。圖片以 390×844 mobile viewport 擷取 5m chart，caption 包含 symbol、price、該根 tick-by-tick `price × quantity` USD volume、USD volume MA20 與 Delta Z-score。
+通知目前只發送 bullish absorption，監看規則如下：
+
+- `1m`：該根 tick-by-tick `price × quantity` USD volume 必須大於 20,000 美金。
+- `5m`：該根 tick-by-tick `price × quantity` USD volume 必須大於 50,000 美金。
+
+每個有新 tick 的 symbol 都會即時重新判斷；同一 symbol、timeframe、candle 與方向只發送一次，重啟後也不重複。圖片以 390×844 mobile viewport 擷取對應 timeframe 的 chart，caption 包含 symbol、price、USD volume、USD volume threshold、USD volume MA20 與 Delta Z-score。
 
 ABS 需要 100 根 Delta Z-score 歷史，因此新的資料庫需先累積至少 100 根連續 5m raw ticks（約 8 小時 20 分鐘）才會通知。這項限制避免用缺失資料製造假訊號。
 
