@@ -42,7 +42,25 @@ BotFather 只負責建立 bot；實際發送使用 Telegram Bot API。先在 Tel
 }
 ```
 
-不知道 chat ID 時，可先只填 `bot_token`，傳訊息給 bot 後執行 `python notifier.py --discover-chat-id`。填妥兩個欄位後執行 `python app.py`，server 會自動啟動 notifier；server 關閉時也會一併停止 notifier。`config.json` 已由 Git 忽略，仍應限制檔案存取權限。已公開的 token 應先用 BotFather `/revoke` 撤銷並重發。
+`chat_id` 不是 bot username。私人聊天通常是數字 ID；不可填 `kt_volume_bot` 或 `@kt_volume_bot`。不知道 chat ID 時，先在手機開啟 bot、按 Start 並傳一則訊息，再執行：
+
+```bash
+python notifier.py --discover-chat-id
+```
+
+把顯示的數字填入 `config.json` 後，立即測試而不等待 ABS：
+
+```bash
+python notifier.py --test-telegram
+```
+
+檢查 remote machine 的 tick 新鮮度、100×5m 歷史覆蓋、當前 ABS 與已發送紀錄：
+
+```bash
+python notifier.py --diagnose
+```
+
+填妥兩個欄位後執行 `python app.py`，server 會自動啟動 notifier；server 關閉時也會一併停止 notifier。notifier 啟動時會先驗證 Telegram destination，錯誤時直接退出並顯示 Telegram 原因。`config.json` 已由 Git 忽略，仍應限制檔案存取權限。已公開的 token 應先用 BotFather `/revoke` 撤銷並重發。
 
 通知目前固定監看 5m timeframe。每個有新 tick 的 symbol 都會即時重新判斷；同一 symbol、5m candle 與方向只發送一次，重啟後也不重複。圖片以 390×844 mobile viewport 擷取 5m chart，caption 包含 symbol、price、該根 tick-by-tick `price × quantity` USD volume、USD volume MA20 與 Delta Z-score。
 
