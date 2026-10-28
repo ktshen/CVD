@@ -1,16 +1,21 @@
 import tempfile
+import sqlite3
 import unittest
 from pathlib import Path
 
 from cvd.database import (
     aggregate_cvd,
     aggregate_cvd_from_minutes,
+    advance_trade_gap,
     cleanup_old_trades,
     connect,
     database_is_ready,
     ensure_database_ready,
     initialize,
     insert_trades,
+    next_trade_gap,
+    recover_trade_gap,
+    recovery_revision,
     trades_after,
 )
 from cvd.database import recent_trade_buckets, recent_trade_buckets_from_minutes
@@ -99,6 +104,65 @@ class DatabaseTest(unittest.TestCase):
 
         self.assertEqual(insert_trades(self.connection, trades), 1)
         self.assertEqual(insert_trades(self.connection, trades), 0)
+
+    def test_gap_survives_restart_and_backfill_is_idempotent(self) -> None:
+        insert_trades(self.connection, [("BTCUSDT", 10, 1000, 100.0, 1.0, 0)], track_gaps=True)
+        self.connection.close()
+        self.connection = connect(self.db_path)
+        insert_trades(self.connection, [("BTCUSDT", 13, 1003, 103.0, 1.0, 1)], track_gaps=True)
+        self.assertEqual(next_trade_gap(self.connection), ("BTCUSDT", 11, 12))
+        with self.assertRaises(ValueError):
+            advance_trade_gap(self.connection, "BTCUSDT", 11, 12, 12)
+        recovered = [("BTCUSDT", 11, 1001, 101.0, 1.0, 0)]
+        self.assertEqual(insert_trades(self.connection, recovered, track_gaps=True), 1)
+        self.assertEqual(insert_trades(self.connection, recovered, track_gaps=True), 0)
+        advance_trade_gap(self.connection, "BTCUSDT", 11, 12, 11)
+        self.assertEqual(next_trade_gap(self.connection), ("BTCUSDT", 12, 12))
+        insert_trades(self.connection, [("BTCUSDT", 12, 1002, 102.0, 1.0, 0)], track_gaps=True)
+        advance_trade_gap(self.connection, "BTCUSDT", 12, 12, 12)
+        self.assertIsNone(next_trade_gap(self.connection))
+        self.assertEqual(recent_trade_buckets_from_minutes(self.connection, "BTCUSDT", 60000, 0),
+                         recent_trade_buckets(self.connection, "BTCUSDT", 60000, 0))
+
+    def test_failed_batch_rolls_back_ticks_markers_and_gaps(self) -> None:
+        insert_trades(self.connection, [("BTCUSDT", 10, 1000, 100.0, 1.0, 0)], track_gaps=True)
+        with self.assertRaises(OverflowError):
+            insert_trades(self.connection, [("BTCUSDT", 13, 1003, 103.0, 1.0, 0),
+                                            ("ETHUSDT", 2**64, 1000, 10.0, 1.0, 0)], track_gaps=True)
+        self.assertIsNone(next_trade_gap(self.connection))
+        self.assertEqual(len(trades_after(self.connection, "BTCUSDT", 0)), 1)
+
+    def test_invalid_trade_does_not_silently_advance_checkpoint(self) -> None:
+        insert_trades(self.connection, [("BTCUSDT", 10, 1000, 100.0, 1.0, 0)], track_gaps=True)
+        with self.assertRaises(sqlite3.IntegrityError):
+            insert_trades(self.connection, [("BTCUSDT", 13, 1003, 103.0, 1.0, 2)], track_gaps=True)
+        marker = self.connection.execute("SELECT trade_id FROM symbol_trade_state WHERE symbol = 'BTCUSDT'").fetchone()[0]
+        self.assertEqual(marker, 10)
+        self.assertIsNone(next_trade_gap(self.connection))
+
+    def test_recovery_schema_upgrade_preserves_existing_ticks(self) -> None:
+        insert_trades(self.connection, [("BTCUSDT", 10, 1000, 100.0, 1.0, 0)])
+        self.connection.execute("DROP TABLE trade_gaps")
+        self.connection.execute("DROP TABLE symbol_recovery_state")
+        self.connection.commit()
+        self.assertFalse(database_is_ready(self.db_path))
+        self.assertTrue(ensure_database_ready(self.db_path))
+        self.assertEqual(len(trades_after(self.connection, "BTCUSDT", 0)), 1)
+        self.assertTrue(database_is_ready(self.db_path))
+
+    def test_recovery_commits_ticks_gap_and_revision_together(self) -> None:
+        insert_trades(self.connection, [("BTCUSDT", 10, 1000, 100.0, 1.0, 0),
+                                        ("BTCUSDT", 13, 1003, 103.0, 1.0, 1)], track_gaps=True)
+        gap = ("BTCUSDT", 11, 12)
+        with self.assertRaises(ValueError):
+            recover_trade_gap(self.connection, gap, [("BTCUSDT", 12, 1002, 102.0, 1.0, 0)])
+        self.assertEqual(recovery_revision(self.connection, "BTCUSDT"), 0)
+        rows = [("BTCUSDT", 11, 1001, 101.0, 1.0, 0), ("BTCUSDT", 12, 1002, 102.0, 1.0, 0)]
+        self.assertEqual(recover_trade_gap(self.connection, gap, rows), 2)
+        self.assertEqual(recovery_revision(self.connection, "BTCUSDT"), 1)
+        self.assertIsNone(next_trade_gap(self.connection))
+        self.assertEqual(recent_trade_buckets_from_minutes(self.connection, "BTCUSDT", 60000, 0),
+                         recent_trade_buckets(self.connection, "BTCUSDT", 60000, 0))
 
     def test_cleanup_deletes_only_expired_rows(self) -> None:
         day_ms = 24 * 60 * 60 * 1000

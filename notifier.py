@@ -206,10 +206,12 @@ class MobileChartCapture:
         return self
 
     def __exit__(self, *_: object) -> None:
-        if self.browser is not None:
-            self.browser.close()
-        if self.playwright is not None:
-            self.playwright.stop()
+        try:
+            if self.browser is not None:
+                self.browser.close()
+        finally:
+            if self.playwright is not None:
+                self.playwright.stop()
 
     def capture(self, symbol: str, interval: str, output_path: Path) -> None:
         assert self.browser is not None
@@ -248,6 +250,8 @@ def signal_caption(signal: AbsSignal) -> str:
 
 
 def evaluate_symbol(connection, symbol: str, interval: str) -> AbsSignal | None:
+    if connection.execute("SELECT 1 FROM trade_gaps WHERE symbol = ? LIMIT 1", (symbol.upper(),)).fetchone():
+        return None
     interval_ms = INTERVALS_MS[interval]
     current_bucket_ms = int(time.time() * 1000) // interval_ms * interval_ms
     start_ms = current_bucket_ms - (ZSCORE_LENGTH - 1) * interval_ms
@@ -338,7 +342,8 @@ def wait_for_dashboard() -> None:
                     logging.info("Chart server is ready")
                     return
         except (urllib.error.URLError, TimeoutError):
-            time.sleep(1)
+            pass
+        time.sleep(1)
 
 
 def monitor() -> None:
@@ -366,6 +371,8 @@ def monitor() -> None:
             sent = 0
             errors = 0
             while True:
+                if not capture.browser.is_connected():
+                    raise RuntimeError("Chart capture browser disconnected; restarting notifier")
                 cycle_started = time.monotonic()
                 markers = latest_symbol_markers(connection)
                 for symbol, marker in markers.items():
@@ -445,7 +452,12 @@ def main() -> None:
     elif args.diagnose:
         diagnose()
     else:
-        monitor()
+        while True:
+            try:
+                monitor()
+            except Exception:
+                logging.exception("Notifier stopped unexpectedly; retrying in 30 seconds")
+                time.sleep(30)
 
 
 if __name__ == "__main__":

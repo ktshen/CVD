@@ -45,6 +45,8 @@ let bookGeneration = 0;
 let oiTimer = null;
 let tradeRenderTimer = null;
 let pendingTrades = [];
+let chartController = null;
+let chartRetryTimer = null;
 
 chart.panes()[0].setStretchFactor(5);
 chart.panes()[1].setStretchFactor(1.2);
@@ -264,6 +266,7 @@ function updateOiContext(indicator) {
 
 function applyTrades(trades) {
     for (const trade of trades) {
+    if (trade.tradeId <= marketState.lastTradeId) continue;
         const bucket = Math.floor(trade.time / marketState.intervalMs) * marketState.intervalMs / 1000;
         let candle = marketState.candles.at(-1);
         if (!candle || candle.time < bucket) {
@@ -294,6 +297,14 @@ function applyTrades(trades) {
         marketState.tickCount += 1;
         marketState.lastTradeId = trade.tradeId;
     }
+    const firstTime = marketState.candles[0]?.time;
+    marketState.cvd = marketState.cvd.filter(item => item.time >= firstTime);
+    let cumulative = 0;
+    for (const item of marketState.cvd) {
+        cumulative += item.delta;
+        item.cvd = cumulative;
+    }
+    marketState.tickCount = marketState.cvd.reduce((total, item) => total + item.trades, 0);
     recomputeIndicators();
     renderSeries();
     updateSummary();
@@ -315,11 +326,26 @@ function connectMarketSocket() {
     const generation = ++socketGeneration;
     if (marketSocket) marketSocket.close();
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const params = new URLSearchParams({ symbol: marketState.symbol, after: marketState.lastTradeId });
-    marketSocket = new WebSocket(`${protocol}//${location.host}/ws/market?${params}`);
-    marketSocket.addEventListener('open', () => setStatus('live', 'WebSocket 即時連線'));
-    marketSocket.addEventListener('message', event => {
-        const payload = JSON.parse(event.data);
+    const params = new URLSearchParams({ symbol: marketState.symbol, after: marketState.lastTradeId, revision: marketState.recoveryRevision ?? 0 });
+    const socket = new WebSocket(`${protocol}//${location.host}/ws/market?${params}`);
+    marketSocket = socket;
+    socket.addEventListener('open', () => {
+        if (generation === socketGeneration) setStatus('live', 'WebSocket 即時連線');
+    });
+    socket.addEventListener('message', event => {
+        if (generation !== socketGeneration) return;
+        let payload;
+        try {
+            payload = JSON.parse(event.data);
+        } catch (error) {
+            console.error(error);
+            socket.close();
+            return;
+        }
+        if (payload.type === 'reload' && payload.symbol === marketState.symbol) {
+            loadChart();
+            return;
+        }
         if (payload.error) {
             console.error(payload.error);
             message.textContent = payload.error.split('\n').at(-2) || payload.error;
@@ -327,12 +353,14 @@ function connectMarketSocket() {
         }
         if (payload.type === 'trades' && payload.symbol === marketState.symbol) enqueueTrades(payload.trades);
     });
-    marketSocket.addEventListener('close', () => {
+    socket.addEventListener('close', () => {
         if (generation !== socketGeneration) return;
         setStatus('error', 'WebSocket 重連中');
-        setTimeout(connectMarketSocket, 2000);
+        setTimeout(() => {
+            if (generation === socketGeneration) connectMarketSocket();
+        }, 2000);
     });
-    marketSocket.addEventListener('error', () => marketSocket.close());
+    socket.addEventListener('error', () => socket.close());
 }
 
 function renderBookSide(elementId, levels) {
@@ -356,38 +384,54 @@ function connectOrderBook() {
     if (orderBookSocket) orderBookSocket.close();
     const status = document.getElementById('book-status');
     const stream = `${marketState.depthWebSocketUrl}/${marketState.symbol.toLowerCase()}@depth10@100ms`;
-    orderBookSocket = new WebSocket(stream);
-    orderBookSocket.addEventListener('open', () => {
+    const socket = new WebSocket(stream);
+    orderBookSocket = socket;
+    socket.addEventListener('open', () => {
+        if (generation !== bookGeneration) return;
         status.className = 'book-status live';
         status.querySelector('span').textContent = '100ms LIVE';
     });
-    orderBookSocket.addEventListener('message', event => {
-        const payload = JSON.parse(event.data);
+    socket.addEventListener('message', event => {
+        if (generation !== bookGeneration) return;
+        let payload;
+        try {
+            payload = JSON.parse(event.data);
+        } catch (error) {
+            console.error(error);
+            socket.close();
+            return;
+        }
         renderBookSide('book-bids', payload.bids || payload.b || []);
         renderBookSide('book-asks', payload.asks || payload.a || []);
     });
-    orderBookSocket.addEventListener('close', () => {
+    socket.addEventListener('close', () => {
         if (generation !== bookGeneration) return;
         status.className = 'book-status';
         status.querySelector('span').textContent = '重連中';
-        setTimeout(() => marketState && connectOrderBook(), 1000);
+        setTimeout(() => {
+            if (generation === bookGeneration && marketState) connectOrderBook();
+        }, 1000);
     });
-    orderBookSocket.addEventListener('error', () => orderBookSocket.close());
+    socket.addEventListener('error', () => socket.close());
     document.getElementById('book-symbol').textContent = `${marketState.symbol} · 10 LEVELS`;
 }
 
 async function refreshOpenInterest() {
-    if (!marketState || marketState.oiError) return;
+    if (!marketState) return;
+    const state = marketState;
     try {
-        const response = await fetch(`/api/open-interest?symbol=${encodeURIComponent(marketState.symbol)}`);
+        const response = await fetch(`/api/open-interest?symbol=${encodeURIComponent(state.symbol)}`, { signal: AbortSignal.timeout(20000) });
         const payload = await response.json();
+        if (state !== marketState) return;
         if (!response.ok) throw new Error(payload.error);
+        marketState.oiError = null;
         const latest = marketState.indicators.at(-1);
         if (latest) latest.openInterest = payload.openInterest;
         recomputeIndicators();
         renderSeries();
         updateHover(marketState.candles.at(-1));
     } catch (error) {
+        if (state !== marketState) return;
         marketState.oiError = error.message;
         updateOiContext(null);
     }
@@ -398,7 +442,12 @@ async function loadChart() {
     if (!symbol) return;
     document.body.dataset.chartReady = 'false';
     symbolInput.value = symbol;
-    socketGeneration += 1;
+    if (chartController) chartController.abort();
+    if (chartRetryTimer !== null) clearTimeout(chartRetryTimer);
+    chartRetryTimer = null;
+    const controller = new AbortController();
+    chartController = controller;
+    const generation = ++socketGeneration;
     bookGeneration += 1;
     if (marketSocket) marketSocket.close();
     if (orderBookSocket) orderBookSocket.close();
@@ -409,10 +458,13 @@ async function loadChart() {
     loadButton.disabled = true;
     message.textContent = `${symbol} · ${intervalInput.value} 資料載入中`;
     setStatus('', '同步中');
+    let retryable = true;
     try {
         const params = new URLSearchParams({ symbol, interval: intervalInput.value, limit: '500', compact: '1' });
-        const response = await fetch(`/api/chart?${params}`);
+        const response = await fetch(`/api/chart?${params}`, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]) });
         const data = await response.json();
+        if (generation !== socketGeneration) return;
+        retryable = response.status >= 500;
         if (!response.ok) throw new Error([data.error, data.details].filter(Boolean).join('\n'));
         marketState = { ...data, tickCount: data.cvd.reduce((total, bucket) => total + bucket.trades, 0) };
         recomputeIndicators();
@@ -425,16 +477,18 @@ async function loadChart() {
             : 'Klines 已載入；等待本地 collector 累積此交易對資料';
         connectMarketSocket();
         connectOrderBook();
-        if (!marketState.oiError) {
-            refreshOpenInterest();
-            oiTimer = setInterval(refreshOpenInterest, 5000);
-        }
+        refreshOpenInterest();
+        oiTimer = setInterval(refreshOpenInterest, 5000);
     } catch (error) {
+        if (controller.signal.aborted || generation !== socketGeneration) return;
         console.error(error);
         message.textContent = error.message;
         setStatus('error', '載入失敗');
+        if (retryable) chartRetryTimer = setTimeout(() => {
+            if (generation === socketGeneration) loadChart();
+        }, 5000);
     } finally {
-        loadButton.disabled = false;
+        if (chartController === controller) loadButton.disabled = false;
     }
 }
 

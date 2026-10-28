@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import copy
 import unittest
 import tempfile
 import threading
@@ -9,11 +10,27 @@ from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 from collector import InsertionStats, parse_trade, write_batches
+from cvd.config import DEFAULT_CONFIG, _validate_config
 from cvd.database import connect, initialize
 from cvd.market import TtlCache, align_open_interest, fetch_klines
 
 
 class MarketTest(unittest.TestCase):
+    def test_configuration_rejects_settings_that_break_collection(self) -> None:
+        _validate_config(copy.deepcopy(DEFAULT_CONFIG))
+        for section, key, value in [("collector", "streams_per_connection", 0),
+                                    ("collector", "streams_per_connection", 1025),
+                                    ("collector", "queue_max_size", -1),
+                                    ("collector", "symbols", "BTCUSDT"),
+                                    ("collector", "auto_start", "false"),
+                                    ("notifications", "poll_seconds", float("nan")),
+                                    ("binance", "websocket_url", "https://example.com")]:
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            config[section][key] = value
+            with self.subTest(section=section, key=key, value=value):
+                with self.assertRaises(RuntimeError):
+                    _validate_config(config)
+
     def test_ttl_cache_coalesces_concurrent_loads(self) -> None:
         cache = TtlCache(ttl_seconds=10, max_size=10)
         calls = 0

@@ -4,13 +4,39 @@ from unittest.mock import patch
 
 from cvd.market import INTERVALS_MS
 from notifier import detect_abs_signal, evaluate_symbol, send_test_message, signal_caption
+import notifier
+import cleanup
 
 
 class NotifierTest(unittest.TestCase):
+    def test_pending_raw_tick_gap_suppresses_abs_signals(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE trade_gaps (symbol TEXT)")
+        connection.execute("INSERT INTO trade_gaps VALUES ('BTCUSDT')")
+        self.assertIsNone(evaluate_symbol(connection, "BTCUSDT", "5m"))
+
+    @patch("notifier.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("notifier.monitor", side_effect=OSError("temporary storage error"))
+    @patch("sys.argv", ["notifier.py"])
+    def test_standalone_notifier_retries_after_failure(self, monitor, sleep) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            notifier.main()
+        sleep.assert_called_once_with(30)
+
+    @patch("cleanup.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("cleanup.clean_once", side_effect=sqlite3.OperationalError("locked"))
+    @patch("sys.argv", ["cleanup.py"])
+    def test_cleanup_retries_after_database_failure(self, clean_once, sleep) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            cleanup.main()
+        sleep.assert_called_once()
+
     def test_evaluate_symbol_treats_missing_trade_buckets_as_zero_delta(self) -> None:
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         connection.execute("CREATE TABLE spot_trade_minutes (symbol TEXT, bucket_time INTEGER)")
+        connection.execute("CREATE TABLE trade_gaps (symbol TEXT)")
         interval_ms = INTERVALS_MS["5m"]
         with patch("notifier.time.time", return_value=100 * interval_ms / 1000):
             start_ms = interval_ms

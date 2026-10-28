@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
@@ -25,6 +27,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "websocket_heartbeat_seconds": 30,
         "reconnect_delay_seconds": 5,
         "report_interval_seconds": 60,
+        "shutdown_timeout_seconds": 60,
         "lock_file": "data/collector.lock",
     },
     "cleanup": {"auto_start": False, "retention_days": 90, "interval_seconds": 3_600},
@@ -71,7 +74,57 @@ def _project_path(value: str) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def _validate_config(config: dict[str, Any]) -> None:
+    for section in DEFAULT_CONFIG:
+        if not isinstance(config.get(section), dict):
+            raise RuntimeError(f"Configuration section {section} must be an object")
+    integer_settings = {
+        "collector": ("streams_per_connection", "write_batch_size", "queue_max_size", "websocket_heartbeat_seconds",
+                      "reconnect_delay_seconds", "report_interval_seconds", "shutdown_timeout_seconds"),
+        "cleanup": ("retention_days", "interval_seconds"),
+        "indicators": ("open_interest_change_length",),
+        "server": ("port", "market_data_threads"),
+    }
+    for section, keys in integer_settings.items():
+        for key in keys:
+            value = config[section][key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise RuntimeError(f"{section}.{key} must be a positive integer")
+    for section, key in (("notifications", "poll_seconds"), ("notifications", "report_interval_seconds"),
+                         ("server", "websocket_poll_seconds")):
+        value = config[section][key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise RuntimeError(f"{section}.{key} must be a finite positive number")
+    if config["collector"]["streams_per_connection"] > 1024:
+        raise RuntimeError("collector.streams_per_connection must not exceed 1024")
+    if config["server"]["port"] > 65535:
+        raise RuntimeError("server.port must not exceed 65535")
+    for section in ("collector", "cleanup", "notifications"):
+        if not isinstance(config[section]["auto_start"], bool):
+            raise RuntimeError(f"{section}.auto_start must be a boolean")
+    for key in ("symbols", "quote_assets"):
+        values = config["collector"][key]
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
+            raise RuntimeError(f"collector.{key} must be an array of nonempty strings")
+    for section, key in (("database", "path"), ("collector", "lock_file"), ("server", "host")):
+        value = config[section][key]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"{section}.{key} must be a nonempty string")
+    for section, key, schemes in (("binance", "rest_url", {"http", "https"}),
+                                  ("binance", "futures_rest_url", {"http", "https"}),
+                                  ("binance", "websocket_url", {"ws", "wss"}),
+                                  ("binance", "depth_websocket_url", {"ws", "wss"}),
+                                  ("notifications", "chart_base_url", {"http", "https"})):
+        value = config[section][key]
+        if not isinstance(value, str):
+            raise RuntimeError(f"{section}.{key} must be a URL")
+        parsed = urlsplit(value)
+        if parsed.scheme not in schemes or not parsed.hostname:
+            raise RuntimeError(f"{section}.{key} has an invalid URL")
+
+
 CONFIG = _load_config()
+_validate_config(CONFIG)
 DB_PATH = _project_path(str(CONFIG["database"]["path"]))
 BINANCE_REST_URL = str(CONFIG["binance"]["rest_url"]).rstrip("/")
 BINANCE_WS_URL = str(CONFIG["binance"]["websocket_url"])
@@ -87,6 +140,7 @@ WS_HEARTBEAT_SECONDS = int(CONFIG["collector"]["websocket_heartbeat_seconds"])
 RECONNECT_DELAY_SECONDS = int(CONFIG["collector"]["reconnect_delay_seconds"])
 REPORT_INTERVAL_SECONDS = int(CONFIG["collector"]["report_interval_seconds"])
 COLLECTOR_LOCK_PATH = _project_path(str(CONFIG["collector"]["lock_file"]))
+COLLECTOR_SHUTDOWN_SECONDS = int(CONFIG["collector"]["shutdown_timeout_seconds"])
 CLEANUP_AUTO_START = bool(CONFIG["cleanup"]["auto_start"])
 RETENTION_DAYS = int(CONFIG["cleanup"]["retention_days"])
 CLEANUP_INTERVAL_SECONDS = int(CONFIG["cleanup"]["interval_seconds"])

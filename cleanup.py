@@ -18,12 +18,19 @@ def clean_once() -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Delete expired Binance aggregate trades")
+    parser = argparse.ArgumentParser(description="Delete expired Binance raw trades")
     parser.add_argument("--once", action="store_true", help="clean once and exit")
     args = parser.parse_args()
     while True:
-        deleted = clean_once()
-        logging.info("Deleted %d trades older than %d days", deleted, RETENTION_DAYS)
+        try:
+            deleted = clean_once()
+            logging.info("Deleted %d trades older than %d days", deleted, RETENTION_DAYS)
+        except Exception:
+            logging.exception("Cleanup failed")
+            if args.once:
+                raise
+            time.sleep(min(CLEANUP_INTERVAL_SECONDS, 60))
+            continue
         if args.once:
             return
         time.sleep(CLEANUP_INTERVAL_SECONDS)

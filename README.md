@@ -28,6 +28,36 @@ python app.py
 
 持續運行時，collector 每分鐘回報寫入 rows 與 queue depth；notifier 每分鐘回報追蹤 symbols、實際 evaluations、alerts、errors 與最新掃描耗時。這些摘要可用來判斷 CPU 消耗來源。
 
+### 收集器故障恢復
+
+- SQLite 寫入在背景執行緒進行，不會卡住 WebSocket event loop。寫入失敗會保留原批次重試，只有成功提交後才確認 queue 中的 tick 已處理。
+- 啟動時網路或資料庫暫時失敗會重試；串流訂閱會檢查確認訊息，斷線、訂閱被拒或接收逾時會重新連線。壞 JSON 或非法成交欄位不會終止整個收集器。
+- 每次提交即時 tick 時，會與已儲存的最高 raw trade ID 比對，將新發現的缺口一起寫入 `trade_gaps`。重啟後紀錄仍保留。
+- 背景補抓使用 `/api/v3/historicalTrades`，每次最多 1,000 筆，正常每秒最多一次請求；HTTP 418/429 會遵守 `Retry-After` 並退避至少 60 秒。這是 raw trades，不是 `aggTrade` 或 Klines。
+- 補抓必須回傳從缺口起點開始的連續 ID；資料缺失、API 拒絕或格式錯誤時，缺口保留並記錄錯誤，不會冒充已補完。補抓成交、缺口進度與同步版本會原子提交，圖表收到版本變動後重新載入 CVD。
+- `app.py` 每 5 秒檢查受管理的 workers，意外退出會重啟。正常關閉時會先停止接收，再等待 collector queue 排空，預設最多 60 秒；`collector.shutdown_timeout_seconds` 可調整排空期限，另需預留已進行中的 SQLite 操作收尾時間。逾時後仍可能有未提交資料，須待重新啟動並偵測缺口後補抓。
+- collector 會在資料庫所在目錄建立 `collector.log`，每個檔案約 20 MB，保留 5 份輪替備份。永久性磁碟／資料庫故障會持續報錯，仍需要人員介入。
+
+`GET /api/collector-status` 提供 `running`、`lastTradeTime`、`lastTradeAgeSeconds`、`pendingGaps`、`pendingTradeIds`。`running=true` 只代表程序鎖被持有，不保證成交仍新鮮，應一起觀察資料時間與缺口數。尚有缺口的交易對會暫停 ABS 通知，避免以不完整 tick 計算訊號。
+
+補抓範圍從既有 checkpoint 與新收到的 tick 之間開始；首次收集前的資料，以及本次升級前已存在但未記錄的內部歷史缺口，不會自動全庫掃描補回。交易所已不提供的資料也無法憑空重建。
+
+### 長期運行注意事項
+
+24/7 收集應獨立執行 `collector.py`，並以 Windows 工作排程器／服務或 Linux systemd 管理啟動與程序重啟。沿用外部 collector 時，關閉網頁伺服器不會停止它；由 `app.py` 啟動的 collector 則仍會隨伺服器正常關閉。整個主程序被強制結束或電腦重開機，不能只靠 Python 內部重試恢復，需作業系統層級監督。
+
+SQLite 資料庫應存放在本機非同步目錄，例如 `C:/CVD-data/market.db`，避免使用 OneDrive、網路磁碟或同步中的資料庫。設定 `database.path` 不會搬移既有資料；需要保留歷史時，請先停止所有使用者程序，使用 SQLite backup 或離線一致性備份搬移，再修改路徑。不要在 WAL 寫入中只複製單一 `.db` 檔案。
+
+請停用主機自動睡眠並監控可用磁碟空間。SQLite 使用 WAL 與 `synchronous=FULL` 提高已提交資料的耐斷電性，但斷電、磁碟損壞、記憶體耗盡、交易所停機、長期限流或作業系統終止程序，仍無法保證即時零缺漏；不可把「會重試」視為「資料已完整」。
+
+### 離線測試
+
+```powershell
+python tests/run_offline.py
+```
+
+這個入口封鎖外部 DNS、HTTP 與 socket 連線，只允許 localhost。測試使用 mock、暫存 SQLite 與 `127.0.0.1` 假交易所，不啟動正式 collector，也不向 Binance 或 Telegram 取得資料。若測試意外嘗試連外，即使例外被程式捕捉，測試入口仍以失敗結束。
+
 ## Telegram ABS 即時通知
 
 BotFather 只負責建立 bot；實際發送使用 Telegram Bot API。先在 Telegram 開啟 bot、按 Start 並傳一則訊息。在私人 `config.json` 的 `notifications` 區塊填入：

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -21,6 +24,7 @@ from cvd.config import (
     CLEANUP_AUTO_START,
     COLLECTOR_AUTO_START,
     COLLECTOR_LOCK_PATH,
+    COLLECTOR_SHUTDOWN_SECONDS,
     DB_PATH,
     MARKET_DATA_THREADS,
     NOTIFIER_AUTO_START,
@@ -39,6 +43,7 @@ from cvd.database import (
     ensure_database_ready,
     latest_trade_id,
     minute_rollup_migration_required,
+    recovery_revision,
     trades_after,
 )
 from cvd.indicators import enrich_indicators
@@ -63,12 +68,49 @@ MARKET_EXECUTOR = ThreadPoolExecutor(max_workers=MARKET_DATA_THREADS, thread_nam
 class WorkerSupervisor:
     def __init__(self) -> None:
         self.processes: list[subprocess.Popen] = []
+        self.workers: dict[str, subprocess.Popen | None] = {}
+        self.stopping = threading.Event()
+        self.monitor_thread: threading.Thread | None = None
+
+    def _launch(self, script: str) -> subprocess.Popen | None:
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-u", str(PROJECT_ROOT / script)], cwd=PROJECT_ROOT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            )
+        except OSError:
+            logging.exception("Failed to start %s; supervisor will retry", script)
+            return None
+        self.processes.append(process)
+        logging.info("Started %s (PID %d)", script, process.pid)
+        return process
+
+    def check_workers(self) -> None:
+        for script, process in list(self.workers.items()):
+            if self.stopping.is_set():
+                return
+            if process is not None and process.poll() is None:
+                continue
+            if script == "collector.py" and process_is_running(COLLECTOR_LOCK_PATH):
+                continue
+            if process is not None:
+                logging.error("%s exited with code %s; restarting", script, process.returncode)
+                self.processes.remove(process)
+            self.workers[script] = self._launch(script)
+
+    def _monitor(self) -> None:
+        while not self.stopping.wait(5):
+            try:
+                self.check_workers()
+            except Exception:
+                logging.exception("Worker supervision failed; will retry")
 
     def start(self) -> None:
         scripts: list[str] = []
         if COLLECTOR_AUTO_START:
             if process_is_running(COLLECTOR_LOCK_PATH):
                 logging.info("Collector is already running; server will use the existing process")
+                self.workers["collector.py"] = None
             else:
                 scripts.append("collector.py")
         if CLEANUP_AUTO_START:
@@ -78,19 +120,31 @@ class WorkerSupervisor:
         elif NOTIFIER_AUTO_START:
             logging.warning("ABS notifier disabled: set notifications.bot_token and notifications.chat_id in config.json")
         for script in scripts:
-            process = subprocess.Popen([sys.executable, str(PROJECT_ROOT / script)], cwd=PROJECT_ROOT)
-            self.processes.append(process)
-            logging.info("Started %s (PID %d)", script, process.pid)
+            self.workers[script] = self._launch(script)
+        if self.workers:
+            self.monitor_thread = threading.Thread(target=self._monitor, name="worker-supervisor", daemon=True)
+            self.monitor_thread.start()
 
     def stop(self) -> None:
+        self.stopping.set()
+        if self.monitor_thread is not None:
+            self.monitor_thread.join()
         for process in self.processes:
             if process.poll() is None:
                 logging.info("Stopping worker PID %d", process.pid)
-                process.terminate()
+                try:
+                    if self.workers.get("collector.py") is process:
+                        process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
+                    else:
+                        process.terminate()
+                except OSError:
+                    logging.exception("Could not signal worker PID %d", process.pid)
         for process in self.processes:
             try:
-                process.wait(timeout=10)
+                timeout = COLLECTOR_SHUTDOWN_SECONDS + 10 if self.workers.get("collector.py") is process else 10
+                process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
+                logging.error("Worker PID %d did not stop gracefully; terminating", process.pid)
                 process.kill()
                 process.wait()
 
@@ -146,6 +200,27 @@ def symbols():
         return jsonify({"error": f"Binance symbols unavailable: {error}"}), 502
 
 
+@app.get("/api/collector-status")
+def collector_status():
+    connection = connect(DB_PATH)
+    try:
+        connection.execute("BEGIN")
+        latest = connection.execute("SELECT MAX(trade_time) FROM symbol_trade_state").fetchone()[0]
+        gaps = connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(last_id - first_id + 1), 0) FROM trade_gaps"
+        ).fetchone()
+        connection.commit()
+    finally:
+        connection.close()
+    return jsonify({
+        "running": process_is_running(COLLECTOR_LOCK_PATH),
+        "lastTradeTime": latest,
+        "lastTradeAgeSeconds": None if latest is None else max(0, (time.time() * 1000 - latest) / 1000),
+        "pendingGaps": int(gaps[0]),
+        "pendingTradeIds": int(gaps[1]),
+    })
+
+
 @app.get("/api/chart")
 def chart_data():
     symbol = request.args.get("symbol", "BTCUSDT").strip().upper()
@@ -177,6 +252,7 @@ def chart_data():
     connection = connect(DB_PATH)
     try:
         connection.execute("BEGIN")
+        revision = recovery_revision(connection, symbol)
         checkpoint = latest_trade_id(connection, symbol)
         cvd = aggregate_cvd_from_minutes(connection, symbol, interval_ms, start_ms, end_ms)
         connection.commit()
@@ -209,6 +285,7 @@ def chart_data():
             "interval": interval,
             "intervalMs": interval_ms,
             "lastTradeId": checkpoint,
+            "recoveryRevision": revision,
             "candles": candles,
             "cvd": cvd,
             "indicators": indicators,
@@ -231,19 +308,42 @@ def current_open_interest():
 
 @sock.route("/ws/market")
 def market_socket(websocket):
+    stream_market(websocket)
+
+
+def stream_market(websocket):
     symbol = request.args.get("symbol", "BTCUSDT").strip().upper()
     try:
         trade_id = max(int(request.args.get("after", "0")), 0)
+        requested_revision = request.args.get("revision")
+        revision = None if requested_revision is None else int(requested_revision)
+        if trade_id > 2**63 - 1 or (revision is not None and revision < 0):
+            raise ValueError
     except ValueError:
-        websocket.send(json.dumps({"error": "after must be an integer"}))
+        websocket.send(json.dumps({"error": "after/revision must be valid nonnegative integers"}))
+        return
+    if not symbol.isalnum() or len(symbol) > 20:
+        websocket.send(json.dumps({"error": "Invalid symbol"}))
         return
     connection = connect(DB_PATH)
+    last_heartbeat = 0.0
     try:
         while True:
+            connection.execute("BEGIN")
+            current_revision = recovery_revision(connection, symbol)
             rows = trades_after(connection, symbol, trade_id)
+            connection.commit()
+            if revision is None:
+                revision = current_revision
+            if current_revision != revision:
+                websocket.send(json.dumps({"type": "reload", "symbol": symbol}))
+                return
             if rows:
                 trade_id = int(rows[-1]["tradeId"])
                 websocket.send(json.dumps({"type": "trades", "symbol": symbol, "trades": rows}))
+            elif time.monotonic() - last_heartbeat >= 15:
+                websocket.send(json.dumps({"type": "heartbeat", "symbol": symbol}))
+                last_heartbeat = time.monotonic()
             time.sleep(WEBSOCKET_POLL_SECONDS)
     except ConnectionClosed:
         return

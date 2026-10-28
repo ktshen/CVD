@@ -15,6 +15,8 @@ REQUIRED_SCHEMA_OBJECTS = {
     ("table", "abs_notifications"),
     ("table", "schema_migrations"),
     ("table", "spot_trade_minutes"),
+    ("table", "trade_gaps"),
+    ("table", "symbol_recovery_state"),
     ("trigger", "trg_spot_trades_minute_insert"),
 }
 
@@ -24,9 +26,13 @@ def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=30)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute("PRAGMA busy_timeout=30000")
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -91,8 +97,6 @@ def initialize(db_path: str | Path = DEFAULT_DB_PATH) -> None:
         connection = connect(path)
         connection.executescript(
             """
-            DROP TABLE IF EXISTS agg_trades;
-
             CREATE TABLE IF NOT EXISTS spot_trades (
                 symbol TEXT NOT NULL,
                 trade_id INTEGER NOT NULL,
@@ -113,6 +117,20 @@ def initialize(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 symbol TEXT PRIMARY KEY,
                 trade_id INTEGER NOT NULL,
                 trade_time INTEGER NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS trade_gaps (
+                symbol TEXT NOT NULL,
+                first_id INTEGER NOT NULL,
+                last_id INTEGER NOT NULL,
+                retry_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (symbol, first_id),
+                CHECK (last_id >= first_id)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS symbol_recovery_state (
+                symbol TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL
             ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS abs_notifications (
@@ -298,13 +316,41 @@ def initialize(db_path: str | Path = DEFAULT_DB_PATH) -> None:
 def insert_trades(
     connection: sqlite3.Connection,
     trades: Iterable[tuple[str, int, int, float, float, int]],
+    track_gaps: bool = False,
+) -> int:
+    rows = list(trades)
+    with connection:
+        if track_gaps:
+            connection.execute("BEGIN IMMEDIATE")
+            markers: dict[str, int] = {}
+            for symbol, trade_id, *_ in sorted(rows, key=lambda row: (row[0], row[1])):
+                if symbol not in markers:
+                    state = connection.execute(
+                        "SELECT trade_id FROM symbol_trade_state WHERE symbol = ?", (symbol,)
+                    ).fetchone()
+                    markers[symbol] = int(state[0]) if state is not None else trade_id
+                previous = markers[symbol]
+                if trade_id > previous + 1:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO trade_gaps (symbol, first_id, last_id) VALUES (?, ?, ?)",
+                        (symbol, previous + 1, trade_id - 1),
+                    )
+                    logging.warning("Raw trade gap detected: %s IDs %d..%d", symbol, previous + 1, trade_id - 1)
+                markers[symbol] = max(previous, trade_id)
+        return _insert_trades(connection, rows)
+
+
+def _insert_trades(
+    connection: sqlite3.Connection,
+    trades: Iterable[tuple[str, int, int, float, float, int]],
 ) -> int:
     rows = list(trades)
     cursor = connection.executemany(
         """
-        INSERT OR IGNORE INTO spot_trades
+        INSERT INTO spot_trades
             (symbol, trade_id, trade_time, price, quantity, buyer_is_maker)
         VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(symbol, trade_id) DO NOTHING
         """,
         rows,
     )
@@ -325,8 +371,72 @@ def insert_trades(
         """,
         [(symbol, trade_id, trade_time) for symbol, (trade_id, trade_time) in latest_by_symbol.items()],
     )
-    connection.commit()
     return inserted
+
+
+def next_trade_gap(connection: sqlite3.Connection) -> tuple[str, int, int] | None:
+    row = connection.execute(
+        "SELECT symbol, first_id, last_id FROM trade_gaps WHERE retry_at <= ? "
+        "ORDER BY retry_at, symbol, first_id LIMIT 1",
+        (time.time(),),
+    ).fetchone()
+    return (str(row[0]), int(row[1]), int(row[2])) if row is not None else None
+
+
+def advance_trade_gap(
+    connection: sqlite3.Connection, symbol: str, first_id: int, last_id: int, recovered_id: int,
+) -> None:
+    with connection:
+        _advance_trade_gap(connection, symbol, first_id, last_id, recovered_id)
+
+
+def _advance_trade_gap(
+    connection: sqlite3.Connection, symbol: str, first_id: int, last_id: int, recovered_id: int,
+) -> None:
+    if recovered_id < first_id or recovered_id > last_id:
+        raise ValueError("Recovered trade ID outside gap")
+    count = connection.execute(
+        "SELECT COUNT(*) FROM spot_trades WHERE symbol = ? AND trade_id BETWEEN ? AND ?",
+        (symbol, first_id, recovered_id),
+    ).fetchone()[0]
+    if count != recovered_id - first_id + 1:
+        raise ValueError("Cannot advance gap before all raw trades are committed")
+    connection.execute("DELETE FROM trade_gaps WHERE symbol = ? AND first_id = ?", (symbol, first_id))
+    if recovered_id < last_id:
+        connection.execute(
+            "INSERT INTO trade_gaps (symbol, first_id, last_id, retry_at) VALUES (?, ?, ?, ?)",
+            (symbol, recovered_id + 1, last_id, time.time()),
+        )
+
+
+def recover_trade_gap(
+    connection: sqlite3.Connection, gap: tuple[str, int, int],
+    trades: Iterable[tuple[str, int, int, float, float, int]],
+) -> int:
+    rows = list(trades)
+    symbol, first_id, last_id = gap
+    if not rows or any(row[0] != symbol or row[1] != first_id + index or row[1] > last_id
+                       for index, row in enumerate(rows)):
+        raise ValueError("Recovery batch must contain consecutive raw trade IDs within the gap")
+    with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = connection.execute(
+            "SELECT last_id FROM trade_gaps WHERE symbol = ? AND first_id = ?", (symbol, first_id)
+        ).fetchone()
+        if current is None or int(current[0]) != last_id:
+            raise ValueError("Recovery gap no longer exists")
+        inserted = _insert_trades(connection, rows)
+        _advance_trade_gap(connection, *gap, rows[-1][1])
+        connection.execute(
+            "INSERT INTO symbol_recovery_state (symbol, revision) VALUES (?, 1) "
+            "ON CONFLICT(symbol) DO UPDATE SET revision = revision + 1", (symbol,),
+        )
+    return inserted
+
+
+def recovery_revision(connection: sqlite3.Connection, symbol: str) -> int:
+    row = connection.execute("SELECT revision FROM symbol_recovery_state WHERE symbol = ?", (symbol,)).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 def latest_symbol_markers(connection: sqlite3.Connection) -> dict[str, int]:
@@ -356,14 +466,14 @@ def record_notification(
     direction: str,
     sent_at: int | None = None,
 ) -> None:
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO abs_notifications (symbol, bucket_time, direction, sent_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (symbol.upper(), bucket_time, direction, sent_at if sent_at is not None else int(time.time() * 1000)),
-    )
-    connection.commit()
+    with connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO abs_notifications (symbol, bucket_time, direction, sent_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (symbol.upper(), bucket_time, direction, sent_at if sent_at is not None else int(time.time() * 1000)),
+        )
 
 
 def aggregate_cvd(
